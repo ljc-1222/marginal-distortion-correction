@@ -1,0 +1,16 @@
+{
+    "mesh": {
+        "n_lambda": 128,
+        "n_phi": 128
+    },
+    "loss_weights": {
+        "w_l": 25,
+        "w_c": 1,
+        "w_s": 12,
+        "w_dvc": 1
+    },
+    "blend_c": 30,
+    "stage1_max_iter": 150,
+    "stage2_max_iter": 300,
+    "lbfgs_lr": 1.0
+}

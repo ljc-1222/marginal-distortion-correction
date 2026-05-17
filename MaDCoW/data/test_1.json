@@ -1,0 +1,15 @@
+{
+    "image_path": "test_1.png",
+    "fov_deg": 90.0,
+    "lines": [],
+    "regions": [
+        {
+            "name": "region_1",
+            "mask_path": "mask_region_1.png"
+        },
+        {
+            "name": "region_2",
+            "mask_path": "mask_region_2.png"
+        }
+    ]
+}
