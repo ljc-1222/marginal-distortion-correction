@@ -78,7 +78,7 @@ def parse_args() -> argparse.Namespace:
         ``config`` (str), ``output`` (str), ``crop`` (bool).
     """
     parser = argparse.ArgumentParser(description="MaDCoW marginal distortion correction.")
-    parser.add_argument("--image", required=True, help="Path to the input .jpg.")
+    parser.add_argument("--image", default="./MaDCoW/data/test_1.png", help="Path to the input .jpg.")
     parser.add_argument("--annotations", required=True, help="Path to the annotation JSON.")
     parser.add_argument("--config", default="./MaDCoW/config.json", help="Path to the pipeline config JSON.")
     parser.add_argument("--output", required=True, help="Path of the output image.")
@@ -191,6 +191,8 @@ def run_pipeline(args: argparse.Namespace) -> None:
     cfg = load_config(args.config)
     annotations = load_annotations(args.annotations)
     image_path = args.image or annotations.image_path
+    if not image_path:
+        raise ValueError("No input image path provided in arguments or annotations.")
     image = _read_image(image_path)
     H_img, W_img = image.shape[:2]
 
