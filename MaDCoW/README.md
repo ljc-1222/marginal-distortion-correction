@@ -62,7 +62,9 @@ ROI into the output directory.
 Useful GUI controls:
 
 - `l` or the `Line` button: switch to straight-line mode.
-- Left click twice in line mode: add one line constraint.
+- Left-drag in line mode along an input-image curve corresponding to a
+  real-world straight structure. The stroke is resampled to 128 view-sphere
+  points and saved as `points_dir`.
 - `r` or the `Region` button: switch to ROI painting mode.
 - Left drag in region mode: paint the selected ROI.
 - Right drag in region mode: erase the selected ROI.
@@ -100,8 +102,11 @@ straight-line constraints, and ROI mask paths:
     "fov_deg": 90.0,
     "lines": [
         {
-            "start_dir": [0.0, 0.0],
-            "end_dir": [0.2, 0.0]
+            "points_dir": [
+                [0.0, 0.0],
+                [0.001, 0.0002],
+                "... 126 more points ..."
+            ]
         }
     ],
     "regions": [
@@ -113,8 +118,11 @@ straight-line constraints, and ROI mask paths:
 }
 ```
 
-Paths inside the JSON are resolved relative to the JSON file. Line endpoints
-are view-sphere directions in radians: `lambda` is yaw and `phi` is pitch.
+Paths inside the JSON are resolved relative to the JSON file. Line samples are
+view-sphere directions in radians: `lambda` is yaw and `phi` is pitch. The
+annotated curve may appear curved in the input image, but it should represent
+a real-world straight structure. The output line loss forces the warped curve
+samples to become collinear.
 
 ## Config
 

@@ -99,7 +99,9 @@ def _line_endpoint_weights(mesh: MeshGrid, lines: list[LineAnnotation] | None) -
     cols = np.arange(W, dtype=np.float64)[None, :]
 
     for line in lines:
-        for lam, phi in (line.start_dir, line.end_dir):
+        if len(line.points_dir) < 2:
+            continue
+        for lam, phi in (line.points_dir[0], line.points_dir[-1]):
             i, j = _mesh_fractional_index(mesh, lam, phi)
             dist_sq = (rows - i) * (rows - i) + (cols - j) * (cols - j)
             weights += np.exp(-0.5 * dist_sq / (sigma * sigma))
@@ -205,7 +207,11 @@ if __name__ == "__main__":
     print("edge centre > side?:", bool(centre_band > side_band))
 
     # 3) Line endpoints receive additional Gaussian weight.
-    line = LineAnnotation(start_dir=(0.0, 0.0), end_dir=(0.4, 0.0))
+    line_points = tuple(
+        (float(0.4 * t), 0.0)
+        for t in np.linspace(0.0, 1.0, 128)
+    )
+    line = LineAnnotation(points_dir=line_points)
     weights = compute_weights(np.zeros((80, 100, 3), dtype=np.uint8), cam, mesh, [line])
     centre_weight = weights[31 // 2, 41 // 2]
     corner_weight = weights[0, 0]

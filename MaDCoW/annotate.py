@@ -26,6 +26,8 @@ from .src.camera import Camera
 DEFAULT_IMAGE = Path(__file__).resolve().parent / "data" / "test.jpg"
 FALLBACK_FOV_DEG = 90.0
 PREVIEW_MAX_SIDE = 1200
+LINE_RESAMPLE_POINTS = 128
+LINE_MIN_SPACING_PX = 3.0
 if "MPLCONFIGDIR" not in os.environ:
     mpl_config_dir = Path("/tmp") / "madcow_matplotlib"
     mpl_config_dir.mkdir(parents=True, exist_ok=True)
@@ -178,12 +180,66 @@ def _compute_preview_size(width: int, height: int, max_side: int) -> tuple[int, 
     return preview_width, preview_height
 
 
+def _polyline_length(points: list[tuple[float, float]]) -> float:
+    """Return total arc length of a 2D polyline in preview pixels."""
+    total = 0.0
+    for (x0, y0), (x1, y1) in zip(points, points[1:]):
+        total += math.hypot(x1 - x0, y1 - y0)
+    return total
+
+
+def _resample_polyline(
+    points: list[tuple[float, float]],
+    n_samples: int = LINE_RESAMPLE_POINTS,
+) -> list[tuple[float, float]]:
+    """Resample a 2D polyline to a fixed number of equally spaced points."""
+    if len(points) < 2:
+        raise ValueError("At least two points are required to resample a polyline.")
+    if n_samples < 2:
+        raise ValueError(f"n_samples must be at least 2; got {n_samples}.")
+
+    lengths = [
+        math.hypot(x1 - x0, y1 - y0)
+        for (x0, y0), (x1, y1) in zip(points, points[1:])
+    ]
+    total_length = sum(lengths)
+    if total_length <= 1e-9:
+        return [points[0]] * n_samples
+
+    cumulative = [0.0]
+    for length in lengths:
+        cumulative.append(cumulative[-1] + length)
+
+    targets = np.linspace(0.0, total_length, n_samples)
+    resampled: list[tuple[float, float]] = []
+    segment_idx = 0
+    for target in targets:
+        while segment_idx < len(lengths) - 1 and target > cumulative[segment_idx + 1]:
+            segment_idx += 1
+
+        seg_length = lengths[segment_idx]
+        x0, y0 = points[segment_idx]
+        x1, y1 = points[segment_idx + 1]
+        if seg_length <= 1e-12:
+            resampled.append((float(x0), float(y0)))
+            continue
+
+        alpha = (float(target) - cumulative[segment_idx]) / seg_length
+        x = (1.0 - alpha) * x0 + alpha * x1
+        y = (1.0 - alpha) * y0 + alpha * y1
+        resampled.append((float(x), float(y)))
+
+    resampled[0] = points[0]
+    resampled[-1] = points[-1]
+    return resampled
+
+
 class AnnotationGUI:
     """Interactive annotation tool for a single input image.
 
     Controls:
         * ``l`` / ``r``: switch line / region mode.
-        * Left click twice in line mode: add a straight-line constraint.
+        * Left drag in line mode: trace a straight-structure curve.
         * Left drag in region mode: paint current ROI mask.
         * Right drag in region mode: erase current ROI mask.
         * ``+`` / ``-``: change brush radius.
@@ -192,7 +248,7 @@ class AnnotationGUI:
         * ``u``: undo last line or mask stroke.
         * ``c``: clear current ROI.
         * ``s``: save annotations.
-        * ``escape``: cancel the current pending line or stroke.
+        * ``escape``: cancel the current line or stroke.
     """
 
     def __init__(
@@ -249,8 +305,9 @@ class AnnotationGUI:
 
         self.mode = "line"
         self.brush_radius = max(4, int(round(min(self.height, self.width) * 0.02)))
-        self.lines: list[tuple[tuple[float, float], tuple[float, float]]] = []
-        self.pending_line: tuple[float, float] | None = None
+        self.lines: list[list[tuple[float, float]]] = []
+        self.current_line_points: list[tuple[float, float]] = []
+        self._drawing_line = False
         self.regions: list[dict[str, Any]] = []
         self.current_region = 0
         self.history: list[tuple[str, Any]] = []
@@ -338,7 +395,8 @@ class AnnotationGUI:
         """Switch interaction mode."""
         self.mode = mode
         if mode != "line":
-            self.pending_line = None
+            self._drawing_line = False
+            self.current_line_points = []
         self._refresh()
 
     def _sync_name_box(self) -> None:
@@ -448,14 +506,11 @@ class AnnotationGUI:
         button = getattr(event, "button", None)
         if self.mode == "line":
             if button == 1:
-                if self.pending_line is None:
-                    self.pending_line = (x, y)
-                else:
-                    self.lines.append((self.pending_line, (x, y)))
-                    self.history.append(("line", None))
-                    self.pending_line = None
+                self._drawing_line = True
+                self.current_line_points = [(x, y)]
             elif button == 3:
-                self.pending_line = None
+                self._drawing_line = False
+                self.current_line_points = []
             self._refresh()
             return
 
@@ -467,24 +522,60 @@ class AnnotationGUI:
             self._refresh()
 
     def _on_draw(self, event: object) -> None:
-        """Matplotlib mouse drag handler for region painting.
+        """Matplotlib mouse drag handler for line tracing and region painting.
 
         Args:
             event: A ``matplotlib.backend_bases.MouseEvent``.
         """
-        if not self._drawing or self.mode != "region":
-            return
         if getattr(event, "inaxes", None) is not self.ax:
             return
         if getattr(event, "xdata", None) is None or getattr(event, "ydata", None) is None:
+            return
+
+        if self.mode == "line" and self._drawing_line:
+            x, y = self._clip_xy(float(event.xdata), float(event.ydata))
+            if not self.current_line_points:
+                self.current_line_points = [(x, y)]
+            else:
+                last_x, last_y = self.current_line_points[-1]
+                if math.hypot(x - last_x, y - last_y) >= LINE_MIN_SPACING_PX:
+                    self.current_line_points.append((x, y))
+            self._refresh()
+            return
+
+        if not self._drawing or self.mode != "region":
             return
 
         x, y = self._clip_xy(float(event.xdata), float(event.ydata))
         self._paint_at(x, y, self._stroke_value)
         self._refresh()
 
-    def _on_release(self, _event: object) -> None:
-        """Finish a paint stroke and store it in undo history."""
+    def _on_release(self, event: object) -> None:
+        """Finish a line or paint stroke and store it in undo history."""
+        if self.mode == "line" and self._drawing_line:
+            if (
+                getattr(event, "inaxes", None) is self.ax
+                and getattr(event, "xdata", None) is not None
+                and getattr(event, "ydata", None) is not None
+            ):
+                x, y = self._clip_xy(float(event.xdata), float(event.ydata))
+                if self.current_line_points:
+                    last_x, last_y = self.current_line_points[-1]
+                    if math.hypot(x - last_x, y - last_y) > 0.0:
+                        self.current_line_points.append((x, y))
+
+            self._drawing_line = False
+            if (
+                len(self.current_line_points) >= 2
+                and _polyline_length(self.current_line_points) >= LINE_MIN_SPACING_PX
+            ):
+                resampled = _resample_polyline(self.current_line_points, LINE_RESAMPLE_POINTS)
+                self.lines.append(resampled)
+                self.history.append(("line", None))
+            self.current_line_points = []
+            self._refresh()
+            return
+
         if not self._drawing:
             return
         self._drawing = False
@@ -519,7 +610,8 @@ class AnnotationGUI:
             self._save(str(self.json_path))
             self._refresh()
         elif key == "escape":
-            self.pending_line = None
+            self._drawing_line = False
+            self.current_line_points = []
             self._drawing = False
             self._stroke_snapshot = None
             self._refresh()
@@ -593,18 +685,19 @@ class AnnotationGUI:
             artist.remove()
         self._dynamic_artists.clear()
 
-        for idx, (start, end) in enumerate(self.lines, start=1):
+        for idx, points in enumerate(self.lines, start=1):
+            xs = [p[0] for p in points]
+            ys = [p[1] for p in points]
             line_artist = self.ax.plot(
-                [start[0], end[0]],
-                [start[1], end[1]],
+                xs,
+                ys,
                 color="lime",
                 linewidth=2.0,
-                marker="o",
-                markersize=4,
             )[0]
+            label_x, label_y = points[-1]
             label = self.ax.text(
-                end[0],
-                end[1],
+                label_x,
+                label_y,
                 f" {idx}",
                 color="white",
                 fontsize=9,
@@ -612,15 +705,18 @@ class AnnotationGUI:
             )
             self._dynamic_artists.extend((line_artist, label))
 
-        if self.pending_line is not None:
-            marker = self.ax.plot(
-                [self.pending_line[0]],
-                [self.pending_line[1]],
+        if self.current_line_points:
+            xs = [p[0] for p in self.current_line_points]
+            ys = [p[1] for p in self.current_line_points]
+            active_line = self.ax.plot(
+                xs,
+                ys,
                 color="yellow",
+                linewidth=2.0,
                 marker="o",
-                markersize=7,
+                markersize=3,
             )[0]
-            self._dynamic_artists.append(marker)
+            self._dynamic_artists.append(active_line)
 
         current = self._current_region_data()
         pixels = int(current["mask"].sum())
@@ -634,20 +730,25 @@ class AnnotationGUI:
         )
         self.fig.canvas.draw_idle()
 
-    def _line_json(self) -> list[dict[str, list[float]]]:
-        """Convert preview-space line endpoints into original view-sphere directions."""
-        result: list[dict[str, list[float]]] = []
-        for start, end in self.lines:
-            sx, sy = self._preview_to_original_xy(start[0], start[1])
-            ex, ey = self._preview_to_original_xy(end[0], end[1])
-            start_lam, start_phi = self.camera.pixel_to_direction(np.array([sx]), np.array([sy]))
-            end_lam, end_phi = self.camera.pixel_to_direction(np.array([ex]), np.array([ey]))
-            result.append(
-                {
-                    "start_dir": [float(start_lam[0]), float(start_phi[0])],
-                    "end_dir": [float(end_lam[0]), float(end_phi[0])],
-                }
-            )
+    def _line_json(self) -> list[dict[str, list[list[float]]]]:
+        """Convert preview-space line curves into original view-sphere directions."""
+        result: list[dict[str, list[list[float]]]] = []
+        for points in self.lines:
+            if len(points) != LINE_RESAMPLE_POINTS:
+                raise ValueError(
+                    f"Saved lines must contain exactly {LINE_RESAMPLE_POINTS} points; "
+                    f"got {len(points)}."
+                )
+
+            original_points = [self._preview_to_original_xy(x, y) for x, y in points]
+            xs = np.array([p[0] for p in original_points], dtype=np.float64)
+            ys = np.array([p[1] for p in original_points], dtype=np.float64)
+            lam, phi = self.camera.pixel_to_direction(xs, ys)
+            points_dir = [
+                [float(lam_i), float(phi_i)]
+                for lam_i, phi_i in zip(lam, phi)
+            ]
+            result.append({"points_dir": points_dir})
         return result
 
     def _save(self, json_path: str) -> None:

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import numbers
 from pathlib import Path
 
 import numpy as np
@@ -31,6 +32,9 @@ from .src.stage2_warp import optimize_warp
 from .src.weights import compute_weights
 
 
+LINE_ANNOTATION_POINTS = 128
+
+
 def _resolve_path(path: str, base_dir: Path) -> str:
     """Resolve ``path`` relative to ``base_dir`` when it is not absolute."""
     path_obj = Path(path)
@@ -44,6 +48,13 @@ def _require_mapping(value: object, name: str) -> dict:
     if not isinstance(value, dict):
         raise ValueError(f"{name} must be a JSON object.")
     return value
+
+
+def _require_json_number(value: object, name: str) -> float:
+    """Return a JSON numeric value as float or raise a clear error."""
+    if isinstance(value, bool) or not isinstance(value, numbers.Real):
+        raise ValueError(f"{name} must be numeric.")
+    return float(value)
 
 
 def _read_image(path: str) -> np.ndarray:
@@ -146,11 +157,29 @@ def load_annotations(path: str) -> AnnotationData:
     lines: list[LineAnnotation] = []
     for idx, item in enumerate(lines_raw):
         line = _require_mapping(item, f"annotations.lines[{idx}]")
-        start = tuple(float(v) for v in line["start_dir"])
-        end = tuple(float(v) for v in line["end_dir"])
-        if len(start) != 2 or len(end) != 2:
-            raise ValueError(f"annotations.lines[{idx}] endpoints must each contain two angles.")
-        lines.append(LineAnnotation(start_dir=start, end_dir=end))
+        if "points_dir" not in line:
+            raise ValueError(f"annotations.lines[{idx}] must contain points_dir.")
+        points_raw = line["points_dir"]
+        if not isinstance(points_raw, list):
+            raise ValueError(f"annotations.lines[{idx}].points_dir must be a list.")
+        if len(points_raw) != LINE_ANNOTATION_POINTS:
+            raise ValueError(
+                f"annotations.lines[{idx}].points_dir must contain exactly "
+                f"{LINE_ANNOTATION_POINTS} points; got {len(points_raw)}."
+            )
+
+        points: list[tuple[float, float]] = []
+        for point_idx, point in enumerate(points_raw):
+            point_name = f"annotations.lines[{idx}].points_dir[{point_idx}]"
+            if not isinstance(point, list):
+                raise ValueError(f"{point_name} must be a list of two numeric values.")
+            if len(point) != 2:
+                raise ValueError(f"{point_name} must contain exactly two numeric values.")
+            lam = _require_json_number(point[0], f"{point_name}[0]")
+            phi = _require_json_number(point[1], f"{point_name}[1]")
+            points.append((lam, phi))
+
+        lines.append(LineAnnotation(points_dir=tuple(points)))
 
     regions: list[RegionAnnotation] = []
     for idx, item in enumerate(regions_raw):

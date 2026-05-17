@@ -44,51 +44,14 @@ def _bool_mask_tensor(mask: Tensor | None, ref: Tensor, shape: tuple[int, int], 
     return mask_t
 
 
-def _line_endpoint_tensor(line: LineAnnotation, ref: Tensor) -> tuple[Tensor, Tensor]:
-    """Return one line's endpoints as ``(lambda, phi)`` tensors."""
-    start = torch.tensor(line.start_dir, dtype=ref.dtype, device=ref.device)
-    end = torch.tensor(line.end_dir, dtype=ref.dtype, device=ref.device)
-    return start, end
-
-
-def _direction_vector(lam: Tensor, phi: Tensor) -> Tensor:
-    """Convert ``(lambda, phi)`` directions to 3D unit vectors."""
-    cos_phi = torch.cos(phi)
-    x = torch.sin(lam) * cos_phi
-    y = torch.sin(phi)
-    z = torch.cos(lam) * cos_phi
-    return torch.stack((x, y, z), dim=-1)
-
-
-def _vector_to_direction(v: Tensor) -> tuple[Tensor, Tensor]:
-    """Convert 3D direction vectors back to ``(lambda, phi)``."""
-    norm = torch.linalg.norm(v, dim=-1).clamp_min(_EPS)
-    v_unit = v / norm.unsqueeze(-1)
-    lam = torch.atan2(v_unit[..., 0], v_unit[..., 2])
-    horizontal = torch.linalg.norm(v_unit[..., [0, 2]], dim=-1)
-    phi = torch.atan2(v_unit[..., 1], horizontal)
-    return lam, phi
-
-
-def _sample_arc(line: LineAnnotation, ref: Tensor, n_samples: int) -> tuple[Tensor, Tensor]:
-    """Sample directions along the great-circle arc for a line annotation."""
-    start, end = _line_endpoint_tensor(line, ref)
-    start_vec = _direction_vector(start[0], start[1])
-    end_vec = _direction_vector(end[0], end[1])
-
-    t = torch.linspace(0.0, 1.0, n_samples, dtype=ref.dtype, device=ref.device)
-    dot = torch.clamp(torch.dot(start_vec, end_vec), -1.0, 1.0)
-    omega = torch.acos(dot)
-    sin_omega = torch.sin(omega)
-
-    if bool(torch.abs(sin_omega) <= math.sqrt(_EPS)):
-        samples = (1.0 - t).unsqueeze(-1) * start_vec + t.unsqueeze(-1) * end_vec
-    else:
-        start_w = torch.sin((1.0 - t) * omega) / sin_omega
-        end_w = torch.sin(t * omega) / sin_omega
-        samples = start_w.unsqueeze(-1) * start_vec + end_w.unsqueeze(-1) * end_vec
-
-    return _vector_to_direction(samples)
+def _line_points_tensor(line: LineAnnotation, ref: Tensor) -> tuple[Tensor, Tensor]:
+    """Return annotated line samples as lambda and phi tensors."""
+    points = torch.tensor(line.points_dir, dtype=ref.dtype, device=ref.device)
+    if points.ndim != 2 or points.shape[0] < 2 or points.shape[1] != 2:
+        raise ValueError(
+            "line.points_dir must have shape (N, 2) with at least two samples."
+        )
+    return points[:, 0], points[:, 1]
 
 
 def _query_bilinear_validity(
@@ -195,32 +158,32 @@ def line_loss(
 ) -> Tensor:
     """Compute the straight-line preservation loss ``E_l`` (Eq. 4-5).
 
-    Each line is sampled at ``n_samples`` points ``v_t`` along the arc on
-    the view sphere; the squared distance from ``f(v_t)`` to the image-plane
-    line through ``f(v_start), f(v_end)`` is summed.
+    Each line contributes its annotated view-sphere samples directly. The
+    squared distance from every valid warped sample to the image-plane line
+    through the warped first and last samples is summed.
 
     Args:
         p: Per-vertex output coordinates, shape ``(H, W, 2)``.
         lines: List of straight-line annotations.
         mesh: The view-sphere mesh, used by the internal bilinear sampler.
-        n_samples: Number of sampling points per arc.
+        n_samples: Ignored for freehand annotations and kept only for API
+            compatibility.
         valid_mask: Optional boolean mask selecting vertices supported by the
             input FOV. Lines with invalid endpoints are skipped, and invalid
-            arc samples do not contribute.
+            annotated samples do not contribute.
 
     Returns:
         Scalar tensor.
     """
     if not lines:
         return _zero_like_loss(p)
-    if n_samples < 2:
-        raise ValueError(f"n_samples must be at least 2; got {n_samples}.")
+    _ = n_samples
 
     loss = _zero_like_loss(p)
     for line in lines:
-        start, end = _line_endpoint_tensor(line, p)
-        endpoint_lam = torch.stack((start[0], end[0]))
-        endpoint_phi = torch.stack((start[1], end[1]))
+        sample_lam, sample_phi = _line_points_tensor(line, p)
+        endpoint_lam = torch.stack((sample_lam[0], sample_lam[-1]))
+        endpoint_phi = torch.stack((sample_phi[0], sample_phi[-1]))
         endpoint_valid = _query_bilinear_validity(mesh, endpoint_lam, endpoint_phi, p, valid_mask)
         if not bool(endpoint_valid.all()):
             continue
@@ -232,7 +195,6 @@ def line_loss(
         length = torch.linalg.norm(direction).clamp_min(_EPS)
         normal = torch.stack((-direction[1], direction[0])) / length
 
-        sample_lam, sample_phi = _sample_arc(line, p, n_samples)
         sample_valid = _query_bilinear_validity(mesh, sample_lam, sample_phi, p, valid_mask)
         if int(sample_valid.sum()) < 2:
             continue
@@ -342,6 +304,32 @@ if __name__ == "__main__":
         H, W = mesh.lambda_grid.shape
         return loss / float((H - 1) * (W - 1))
 
+    def _make_line(
+        start: tuple[float, float],
+        end: tuple[float, float],
+        n: int = 128,
+    ) -> LineAnnotation:
+        t_values = torch.linspace(0.0, 1.0, n)
+        points = tuple(
+            (
+                float((1.0 - t) * start[0] + t * end[0]),
+                float((1.0 - t) * start[1] + t * end[1]),
+            )
+            for t in t_values
+        )
+        return LineAnnotation(points_dir=points)
+
+    def _make_curved_line(n: int = 128) -> LineAnnotation:
+        t_values = torch.linspace(0.0, 1.0, n)
+        points = tuple(
+            (
+                float(-0.35 + 0.7 * t),
+                float(0.08 * torch.sin(torch.as_tensor(math.pi, dtype=t.dtype) * t)),
+            )
+            for t in t_values
+        )
+        return LineAnnotation(points_dir=points)
+
     mesh = build_mesh(n_lambda=41, n_phi=31, horizontal_span_deg=60.0)
     lam = torch.from_numpy(mesh.lambda_grid)
     phi = torch.from_numpy(mesh.phi_grid)
@@ -357,28 +345,33 @@ if __name__ == "__main__":
     ec_empty = conformal_loss(p, mesh, w, empty_mask)
     print("empty conformal mask zero?:", bool(torch.allclose(ec_empty, torch.zeros_like(ec_empty))))
 
-    # 3) A sampled horizontal great-circle arc stays straight.
-    line = LineAnnotation(start_dir=(-0.35, 0.0), end_dir=(0.35, 0.0))
+    # 3) A straight annotated line stays straight under stereographic projection.
+    line = _make_line((-0.35, 0.0), (0.35, 0.0))
     el = line_loss(p, [line], mesh, n_samples=16)
-    print("horizontal line loss zero?:", bool(torch.allclose(el, torch.zeros_like(el), atol=1e-12)))
+    print("straight line loss zero?:", bool(torch.allclose(el, torch.zeros_like(el), atol=1e-12)))
 
-    # 4) Linear fields have zero second-order smoothness loss.
+    # 4) A curved annotated line has nonzero loss under a linear warp.
     p_linear = torch.stack((lam, phi), dim=-1).requires_grad_(True)
+    curved_line = _make_curved_line()
+    curved_el = line_loss(p_linear, [curved_line], mesh)
+    print("curved line loss nonzero?:", bool(curved_el > 1e-6))
+
+    # 5) Linear fields have zero second-order smoothness loss.
     es = smoothness_loss(p_linear, mesh, w)
     print("linear smoothness zero?:", bool(torch.allclose(es, torch.zeros_like(es), atol=1e-12)))
 
-    # 5) DVC loss is zero when targets match p on the masked region.
+    # 6) DVC loss is zero when targets match p on the masked region.
     mask = torch.zeros((1,) + lam.shape, dtype=torch.bool)
     mask[:, 10:20, 12:30] = True
     edvc = dvc_loss(p, p.detach().unsqueeze(0), mask)
     print("matching DVC zero?:", bool(torch.allclose(edvc, torch.zeros_like(edvc))))
 
-    # 6) Gradients flow through the combined loss.
+    # 7) Gradients flow through the combined loss.
     total = ec + el + es + edvc
     total.backward()
     print("combined grad finite?:", bool(p.grad is not None and torch.isfinite(p.grad).all()))
 
-    # 7) Non-square angular spacing remains well scaled by derivative terms.
+    # 8) Non-square angular spacing remains well scaled by derivative terms.
     cam = Camera(CameraConfig(fov_deg=90.0, width=160, height=90))
     non_square_mesh = build_input_domain_mesh(cam, n_lambda=41, n_phi=31)
     lam_ns = torch.from_numpy(non_square_mesh.lambda_grid)
@@ -391,7 +384,7 @@ if __name__ == "__main__":
         bool(_conformal_mean(ec_ns, non_square_mesh) < 1e-4),
     )
 
-    # 8) Invalid input-FOV vertices do not contribute to core energies.
+    # 9) Invalid input-FOV vertices do not contribute to core energies.
     wide_mesh = build_mesh(n_lambda=61, n_phi=41, horizontal_span_deg=140.0)
     valid_np = compute_valid_mesh_mask(Camera(CameraConfig(fov_deg=70.0, width=100, height=80)), wide_mesh)
     valid = torch.as_tensor(valid_np, dtype=torch.bool)
@@ -416,10 +409,10 @@ if __name__ == "__main__":
     )
     print("DVC valid mask keeps matching target zero?:", bool(torch.allclose(edvc_valid, torch.zeros_like(edvc_valid))))
 
-    # 9) Line samples use a full bilinear validity footprint.
+    # 10) Line samples use a full bilinear validity footprint.
     line_valid = torch.ones_like(w, dtype=torch.bool)
     line_valid[14:17, 19:22] = False
-    sample_lam, sample_phi = _sample_arc(line, p, n_samples=32)
+    sample_lam, sample_phi = _line_points_tensor(line, p)
     sample_valid = _query_bilinear_validity(mesh, sample_lam, sample_phi, p, line_valid)
     p_line = p.detach().clone()
     p_line_corrupt = p_line.clone()

@@ -58,15 +58,15 @@ class MeshGrid:
 
 @dataclass
 class LineAnnotation:
-    """A single user-annotated straight-line constraint.
+    """A user-annotated straight-structure curve.
 
     Attributes:
-        start_dir: View-sphere direction ``(lambda, phi)`` of the line start.
-        end_dir: View-sphere direction ``(lambda, phi)`` of the line end.
+        points_dir: View-sphere samples ``(lambda, phi)`` along the annotated
+            input-image curve. The curve represents a real-world straight
+            structure that should become straight in the output.
     """
 
-    start_dir: tuple[float, float]
-    end_dir: tuple[float, float]
+    points_dir: tuple[tuple[float, float], ...]
 
 
 @dataclass

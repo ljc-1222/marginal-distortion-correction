@@ -201,7 +201,11 @@ if __name__ == "__main__":
     print("DVC-only ROI reaches target?:", bool(torch.allclose(p_opt[mask], target[mask], atol=1e-5)))
 
     # 2) Eq. 6 equals the explicit weighted sum of the four paper losses.
-    lines = [LineAnnotation(start_dir=(-0.3, 0.0), end_dir=(0.3, 0.0))]
+    line_points = tuple(
+        (float(-0.3 + 0.6 * t), 0.0)
+        for t in torch.linspace(0.0, 1.0, 128)
+    )
+    lines = [LineAnnotation(points_dir=line_points)]
     cfg_eq6 = PipelineConfig(
         mesh_n_lambda=17,
         mesh_n_phi=11,
