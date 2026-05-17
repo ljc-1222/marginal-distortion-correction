@@ -67,38 +67,37 @@ def estimate_fov_from_exif(image_path: str, fallback: float = FALLBACK_FOV_DEG) 
     except OSError:
         return float(fallback), "fallback"
 
-    if piexif is not None:
+    try:
+        exif_dict = piexif.load(str(image_path_obj))
+        exif_ifd = exif_dict.get("Exif", {}) or {}
+
+        f35 = _ratio_to_float(exif_ifd.get(piexif.ExifIFD.FocalLengthIn35mmFilm))
+        if f35 and f35 > 0:
+            fov = math.degrees(2.0 * math.atan(36.0 / (2.0 * f35)))
+            return fov, "EXIF 35mm-equivalent focal length via piexif"
+
+        focal = _ratio_to_float(exif_ifd.get(piexif.ExifIFD.FocalLength))
+        x_res = _ratio_to_float(exif_ifd.get(piexif.ExifIFD.FocalPlaneXResolution))
+        unit_raw = exif_ifd.get(piexif.ExifIFD.FocalPlaneResolutionUnit)
+
         try:
-            exif_dict = piexif.load(str(image_path_obj))
-            exif_ifd = exif_dict.get("Exif", {}) or {}
+            unit = int(unit_raw) if unit_raw is not None else None
+        except (TypeError, ValueError):
+            unit = None
 
-            f35 = _ratio_to_float(exif_ifd.get(piexif.ExifIFD.FocalLengthIn35mmFilm))
-            if f35 and f35 > 0:
-                fov = math.degrees(2.0 * math.atan(36.0 / (2.0 * f35)))
-                return fov, "EXIF 35mm-equivalent focal length via piexif"
-
-            focal = _ratio_to_float(exif_ifd.get(piexif.ExifIFD.FocalLength))
-            x_res = _ratio_to_float(exif_ifd.get(piexif.ExifIFD.FocalPlaneXResolution))
-            unit_raw = exif_ifd.get(piexif.ExifIFD.FocalPlaneResolutionUnit)
-
-            try:
-                unit = int(unit_raw) if unit_raw is not None else None
-            except (TypeError, ValueError):
-                unit = None
-
-            if focal and focal > 0 and x_res and x_res > 0 and unit in (2, 3, 4, 5):
-                unit_to_mm = {
-                    2: 25.4,   # inch
-                    3: 10.0,   # centimeter
-                    4: 1.0,    # millimeter
-                    5: 0.001,  # micrometer
-                }
-                sensor_width_mm = width / x_res * unit_to_mm[unit]
-                if sensor_width_mm > 0:
-                    fov = math.degrees(2.0 * math.atan(sensor_width_mm / (2.0 * focal)))
-                    return fov, "EXIF focal length and focal-plane resolution via piexif"
-        except (OSError, ValueError, KeyError, TypeError, ZeroDivisionError):
-            pass
+        if focal and focal > 0 and x_res and x_res > 0 and unit in (2, 3, 4, 5):
+            unit_to_mm = {
+                2: 25.4,   # inch
+                3: 10.0,   # centimeter
+                4: 1.0,    # millimeter
+                5: 0.001,  # micrometer
+            }
+            sensor_width_mm = width / x_res * unit_to_mm[unit]
+            if sensor_width_mm > 0:
+                fov = math.degrees(2.0 * math.atan(sensor_width_mm / (2.0 * focal)))
+                return fov, "EXIF focal length and focal-plane resolution via piexif"
+    except (OSError, ValueError, KeyError, TypeError, ZeroDivisionError):
+        pass
 
     try:
         with Image.open(image_path_obj) as img:
