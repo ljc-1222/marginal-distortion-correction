@@ -5,3 +5,5 @@
 __pycache__/
 *.pyc
 
+# SAM2 model checkpoints
+sam2/checkpoints/*.pt
