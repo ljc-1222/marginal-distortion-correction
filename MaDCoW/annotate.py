@@ -28,6 +28,12 @@ FALLBACK_FOV_DEG = 90.0
 PREVIEW_MAX_SIDE = 1200
 LINE_RESAMPLE_POINTS = 128
 LINE_MIN_SPACING_PX = 3.0
+CAMERA_MODEL_CHOICES = ("pinhole", "360")
+CAMERA_MODEL_LABELS = {
+    "pinhole": "Pinhole",
+    "360": "360",
+}
+CAMERA_MODEL_FROM_LABEL = {label: model for model, label in CAMERA_MODEL_LABELS.items()}
 if "MPLCONFIGDIR" not in os.environ:
     mpl_config_dir = Path("/tmp") / "madcow_matplotlib"
     mpl_config_dir.mkdir(parents=True, exist_ok=True)
@@ -140,6 +146,14 @@ def _relative_path(path: Path, base_dir: Path) -> str:
         return os.path.relpath(path.resolve(), base_dir.resolve())
 
 
+def _normalize_camera_model(model: str) -> str:
+    """Validate and return the annotation camera model name."""
+    if model in CAMERA_MODEL_CHOICES:
+        return model
+    choices = ", ".join(CAMERA_MODEL_CHOICES)
+    raise ValueError(f"camera_model must be one of: {choices}; got {model!r}.")
+
+
 def _lanczos_resampling() -> int:
     """Return the Pillow LANCZOS resampling enum across Pillow versions."""
     if hasattr(Image, "Resampling"):
@@ -248,28 +262,33 @@ class AnnotationGUI:
         * ``u``: undo last line or mask stroke.
         * ``c``: clear current ROI.
         * ``s``: save annotations.
+        * Camera radio buttons: choose pinhole or 360 annotation geometry.
         * ``escape``: cancel the current line or stroke.
     """
 
     def __init__(
         self,
         image_path: str,
-        fov_deg: float,
+        fov_deg: float | None,
         output_dir: str,
+        camera_model: str = "pinhole",
     ) -> None:
         """Initialize the GUI state.
 
         Args:
             image_path: Path to the input image.
-            fov_deg: Horizontal field of view of the input image, in degrees.
+            fov_deg: Horizontal field of view of a pinhole input image, in degrees.
             output_dir: Directory where the JSON file and mask PNGs are saved.
+            camera_model: Input camera model to store in the annotation JSON.
             preview_max_side: Maximum side length used for the interactive preview.
         """
-        if fov_deg <= 0 or fov_deg >= 180:
-            raise ValueError(f"fov_deg must lie in (0, 180); got {fov_deg}.")
-
         self.image_path = str(Path(image_path).resolve())
-        self.fov_deg = float(fov_deg)
+        self.camera_model = _normalize_camera_model(camera_model)
+        self.fov_deg = None if fov_deg is None else float(fov_deg)
+        if self.camera_model == "pinhole" and self.fov_deg is None:
+            self.fov_deg = FALLBACK_FOV_DEG
+        if self.fov_deg is not None and (self.fov_deg <= 0 or self.fov_deg >= 180):
+            raise ValueError(f"fov_deg must lie in (0, 180); got {self.fov_deg}.")
         self.output_dir = Path(output_dir).resolve()
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -295,13 +314,7 @@ class AnnotationGUI:
             self.preview_width != self.original_width
             or self.preview_height != self.original_height
         )
-        self.camera = Camera(
-            CameraConfig(
-                fov_deg=self.fov_deg,
-                width=self.original_width,
-                height=self.original_height,
-            )
-        )
+        self._set_camera_model(self.camera_model)
 
         self.mode = "line"
         self.brush_radius = max(4, int(round(min(self.height, self.width) * 0.02)))
@@ -322,6 +335,21 @@ class AnnotationGUI:
         self._build_figure()
         self._refresh()
 
+    def _set_camera_model(self, camera_model: str) -> None:
+        """Set the input camera model used for saving line directions."""
+        model = _normalize_camera_model(camera_model)
+        if model == "pinhole" and self.fov_deg is None:
+            self.fov_deg = FALLBACK_FOV_DEG
+        self.camera = Camera(
+            CameraConfig(
+                fov_deg=self.fov_deg,
+                width=self.original_width,
+                height=self.original_height,
+                model=model,
+            )
+        )
+        self.camera_model = self.camera.model
+
     def run(self) -> None:
         """Open the matplotlib window and block until the user exits."""
         import matplotlib.pyplot as plt
@@ -331,7 +359,7 @@ class AnnotationGUI:
     def _build_figure(self) -> None:
         """Create the Matplotlib figure, artists, widgets, and callbacks."""
         import matplotlib.pyplot as plt
-        from matplotlib.widgets import Button, TextBox
+        from matplotlib.widgets import Button, RadioButtons, TextBox
 
         self.fig, self.ax = plt.subplots(figsize=(12, 8))
         self.fig.canvas.manager.set_window_title("MaDCoW Annotation Tool")
@@ -369,6 +397,13 @@ class AnnotationGUI:
         self.name_box = TextBox(name_ax, "ROI name", initial=self._current_region_data()["name"])
         self.name_box.on_submit(self._on_name_submit)
         self.widgets.append(self.name_box)
+
+        camera_ax = self.fig.add_axes([0.43, 0.105, 0.17, 0.06])
+        labels = [CAMERA_MODEL_LABELS[model] for model in CAMERA_MODEL_CHOICES]
+        active = CAMERA_MODEL_CHOICES.index(self.camera_model)
+        self.camera_selector = RadioButtons(camera_ax, labels, active=active)
+        self.camera_selector.on_clicked(self._on_camera_model_select)
+        self.widgets.append(self.camera_selector)
 
         self.fig.canvas.mpl_connect("button_press_event", self._on_click)
         self.fig.canvas.mpl_connect("motion_notify_event", self._on_draw)
@@ -413,6 +448,12 @@ class AnnotationGUI:
             return
         name = text.strip() or f"region_{self.current_region + 1}"
         self._current_region_data()["name"] = name
+        self._refresh()
+
+    def _on_camera_model_select(self, label: str) -> None:
+        """Update the annotation camera model from the GUI selector."""
+        model = CAMERA_MODEL_FROM_LABEL[label]
+        self._set_camera_model(model)
         self._refresh()
 
     def _button_line(self, _event: object) -> None:
@@ -723,10 +764,13 @@ class AnnotationGUI:
         size_text = f"Preview: {self.preview_width}x{self.preview_height}"
         if self.is_downsampled:
             size_text += f" -> Original: {self.original_width}x{self.original_height}"
+        camera_text = f"Camera: {CAMERA_MODEL_LABELS[self.camera_model]}"
+        if self.camera_model == "pinhole":
+            camera_text += f" ({self.fov_deg:.2f} deg)"
         self.status.set_text(
             f"Mode: {self.mode.upper()} | ROI {self.current_region + 1}/{len(self.regions)} "
             f"'{current['name']}' ({pixels} preview px) | Lines: {len(self.lines)} | "
-            f"Brush: {self.brush_radius}px | {size_text} | Save: {self.json_path}"
+            f"Brush: {self.brush_radius}px | {camera_text} | {size_text} | Save: {self.json_path}"
         )
         self.fig.canvas.draw_idle()
 
@@ -786,10 +830,12 @@ class AnnotationGUI:
 
         payload = {
             "image_path": _relative_path(Path(self.image_path), json_out.parent),
-            "fov_deg": self.fov_deg,
-            "lines": self._line_json(),
-            "regions": regions_json,
+            "camera_model": self.camera_model,
         }
+        if self.camera_model == "pinhole":
+            payload["fov_deg"] = self.fov_deg
+        payload["lines"] = self._line_json()
+        payload["regions"] = regions_json
         json_out.write_text(json.dumps(payload, indent=4), encoding="utf-8")
 
 
@@ -798,7 +844,7 @@ def parse_args() -> argparse.Namespace:
 
     Returns:
         Namespace with attributes: ``image`` (str), ``fov`` (float | None),
-        ``output_dir`` (str | None).
+        ``camera_model`` (str), ``output_dir`` (str | None).
     """
     parser = argparse.ArgumentParser(description="MaDCoW annotation GUI.")
     parser.add_argument(
@@ -811,7 +857,17 @@ def parse_args() -> argparse.Namespace:
         "--fov",
         type=float,
         default=None,
-        help="Horizontal FOV in degrees. If omitted, EXIF is used when possible, otherwise 90.",
+        help=(
+            "Horizontal FOV in degrees for pinhole images. If omitted for "
+            "pinhole, EXIF is used when possible, otherwise 90. Ignored by "
+            "360 camera annotations."
+        ),
+    )
+    parser.add_argument(
+        "--camera-model",
+        choices=CAMERA_MODEL_CHOICES,
+        default="pinhole",
+        help="Input camera model to write into the annotation JSON.",
     )
     parser.add_argument(
         "--output-dir",
@@ -824,10 +880,13 @@ def parse_args() -> argparse.Namespace:
 if __name__ == "__main__":
     args = parse_args()
     image_path = Path(args.image).resolve()
-    if args.fov is None:
+    camera_model = _normalize_camera_model(args.camera_model)
+    if camera_model == "pinhole" and args.fov is None:
         fov, source = estimate_fov_from_exif(str(image_path))
         print(f"Using horizontal FOV {fov:.2f} degrees ({source}).")
     else:
         fov = args.fov
+        if camera_model == "360":
+            print("Using 360 camera model.")
     output_dir = args.output_dir or str(image_path.parent)
-    AnnotationGUI(str(image_path), fov, output_dir).run()
+    AnnotationGUI(str(image_path), fov, output_dir, camera_model=camera_model).run()

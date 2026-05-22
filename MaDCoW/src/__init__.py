@@ -28,17 +28,19 @@ Tensor: TypeAlias = torch.Tensor
 
 @dataclass
 class CameraConfig:
-    """Intrinsic configuration of the input perspective camera.
+    """Intrinsic configuration of the input camera.
 
     Attributes:
-        fov_deg: Horizontal field of view of the input image, in degrees.
+        fov_deg: Horizontal field of view of a pinhole input image, in degrees.
         width: Input image width in pixels.
         height: Input image height in pixels.
+        model: Input camera model. Supported values are ``"pinhole"`` and ``"360"``.
     """
 
-    fov_deg: float
+    fov_deg: float | None
     width: int
     height: int
+    model: str = "pinhole"
 
 
 @dataclass
@@ -87,14 +89,16 @@ class AnnotationData:
     """Full set of user annotations attached to one input image.
 
     Attributes:
-        image_path: Path to the input perspective ``.jpg``.
-        fov_deg: Horizontal field of view of the input image in degrees.
+        image_path: Path to the input image.
+        fov_deg: Horizontal field of view of a pinhole input image in degrees.
+        camera_model: Input camera model, either ``"pinhole"`` or ``"360"``.
         lines: List of straight-line annotations.
         regions: List of region-of-interest annotations.
     """
 
     image_path: str
-    fov_deg: float
+    fov_deg: float | None
+    camera_model: str = "pinhole"
     lines: list[LineAnnotation] = field(default_factory=list)
     regions: list[RegionAnnotation] = field(default_factory=list)
 

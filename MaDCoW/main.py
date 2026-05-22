@@ -153,6 +153,9 @@ def load_annotations(path: str) -> AnnotationData:
     regions_raw = data.get("regions", [])
     if not isinstance(regions_raw, list):
         raise ValueError("annotations.regions must be a list.")
+    if "camera_model" not in data:
+        raise ValueError("annotations.camera_model must be set by annotate.py.")
+    camera_model = str(data["camera_model"])
 
     lines: list[LineAnnotation] = []
     for idx, item in enumerate(lines_raw):
@@ -189,9 +192,12 @@ def load_annotations(path: str) -> AnnotationData:
         regions.append(RegionAnnotation(name=name, mask_path=mask_path))
 
     image_path = _resolve_path(str(data.get("image_path", "")), base_dir) if data.get("image_path") else ""
+    fov_value = data.get("fov_deg")
+    fov_deg = None if fov_value is None else float(fov_value)
     return AnnotationData(
         image_path=image_path,
-        fov_deg=float(data["fov_deg"]),
+        fov_deg=fov_deg,
+        camera_model=camera_model,
         lines=lines,
         regions=regions,
     )
@@ -202,7 +208,7 @@ def run_pipeline(args: argparse.Namespace) -> None:
 
     Steps:
         1. Load config and annotations; load the input image.
-        2. Build a :class:`Camera` from the annotation's FOV.
+        2. Build a :class:`Camera` from the annotation's input camera model.
         3. Build the view-sphere :class:`MeshGrid` from the input camera's
            angular domain and the mesh resolution in ``cfg``.
         4. For each ROI mask: rasterize to mesh, compute weights, run
@@ -225,7 +231,14 @@ def run_pipeline(args: argparse.Namespace) -> None:
     image = _read_image(image_path)
     H_img, W_img = image.shape[:2]
 
-    camera = Camera(CameraConfig(fov_deg=annotations.fov_deg, width=W_img, height=H_img))
+    camera = Camera(
+        CameraConfig(
+            fov_deg=annotations.fov_deg,
+            width=W_img,
+            height=H_img,
+            model=annotations.camera_model,
+        )
+    )
     mesh = build_input_domain_mesh(
         camera=camera,
         n_lambda=cfg.mesh_n_lambda,

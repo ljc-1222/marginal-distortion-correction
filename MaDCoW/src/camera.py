@@ -1,4 +1,4 @@
-"""Perspective input-camera model.
+"""Input-camera models.
 
 The :class:`Camera` bridges between input image pixels and view-sphere
 directions ``(lambda, phi)`` in radians. It is the only module that touches
@@ -10,10 +10,13 @@ Conventions:
       origin at the top-left corner, ``x`` increases rightward, ``y`` downward.
       The principal point sits at the geometric image centre
       ``(cx, cy) = ((width - 1) / 2, (height - 1) / 2)``.
-    * The camera frame uses OpenCV's convention: ``+X`` right, ``+Y`` down,
-      ``+Z`` forward along the optical axis.
-    * The horizontal FOV ``cfg.fov_deg`` determines the focal length in
-      pixels via ``f = (width / 2) / tan(fov_rad / 2)``.
+    * Pinhole mode uses OpenCV's camera-frame convention: ``+X`` right,
+      ``+Y`` down, ``+Z`` forward along the optical axis.
+    * In pinhole mode, the horizontal FOV ``cfg.fov_deg`` determines the
+      focal length in pixels via ``f = (width / 2) / tan(fov_rad / 2)``.
+    * Equirectangular mode maps the image width to longitude
+      ``[-pi, pi]`` and the image height to latitude/pitch
+      ``[-pi/2, pi/2]``.
     * View-sphere directions ``(lambda, phi)`` are yaw / pitch in radians:
       ``lambda = atan2(X_cam, Z_cam)`` and
       ``phi = atan2(Y_cam, sqrt(X_cam^2 + Z_cam^2))``. With this convention
@@ -29,7 +32,17 @@ import numpy as np
 from . import Array, CameraConfig
 
 
-class Camera:
+_SUPPORTED_MODELS = {"pinhole", "360"}
+
+
+def _normalize_model(model: str) -> str:
+    """Validate and return the camera model name."""
+    if model in _SUPPORTED_MODELS:
+        return model
+    raise ValueError(f"camera model must be one of {sorted(_SUPPORTED_MODELS)}; got {model!r}.")
+
+
+class _PinholeCamera:
     """Pinhole perspective camera defined by a horizontal field of view.
 
     Attributes:
@@ -46,6 +59,8 @@ class Camera:
         Args:
             cfg: Intrinsic configuration of the input image.
         """
+        if cfg.fov_deg is None:
+            raise ValueError("fov_deg is required for pinhole camera model.")
         if cfg.fov_deg <= 0 or cfg.fov_deg >= 180:
             raise ValueError(f"fov_deg must lie in (0, 180); got {cfg.fov_deg}.")
         if cfg.width <= 0 or cfg.height <= 0:
@@ -147,6 +162,92 @@ class Camera:
         )
         return in_bounds
 
+
+class _EquirectangularCamera:
+    """Full 360x180 input camera model using equirectangular projection."""
+
+    def __init__(self, cfg: CameraConfig) -> None:
+        """Initialize a full equirectangular camera from image dimensions."""
+        if cfg.width < 2 or cfg.height < 2:
+            raise ValueError(
+                "360 camera requires width and height of at least 2; "
+                f"got ({cfg.width}, {cfg.height})."
+            )
+
+        self.cfg = cfg
+        self.cx: float = (cfg.width - 1) / 2.0
+        self.cy: float = (cfg.height - 1) / 2.0
+        self.focal_length: None = None
+
+    def pixel_to_direction(self, x: Array, y: Array) -> tuple[Array, Array]:
+        """Convert equirectangular pixel coordinates to yaw/pitch directions."""
+        x_arr = np.asarray(x, dtype=np.float64)
+        y_arr = np.asarray(y, dtype=np.float64)
+
+        lam = (x_arr / float(self.cfg.width - 1)) * (2.0 * math.pi) - math.pi
+        phi = (y_arr / float(self.cfg.height - 1)) * math.pi - (math.pi / 2.0)
+        return lam, phi
+
+    def direction_to_pixel(self, lam: Array, phi: Array) -> tuple[Array, Array]:
+        """Project yaw/pitch directions to equirectangular pixel coordinates."""
+        lam_arr = np.asarray(lam, dtype=np.float64)
+        phi_arr = np.asarray(phi, dtype=np.float64)
+
+        x = ((lam_arr + math.pi) / (2.0 * math.pi)) * float(self.cfg.width - 1)
+        y = ((phi_arr + (math.pi / 2.0)) / math.pi) * float(self.cfg.height - 1)
+        return x, y
+
+    def direction_in_fov(self, lam: Array, phi: Array) -> Array:
+        """Check whether directions lie in the full equirectangular domain."""
+        lam_arr = np.asarray(lam, dtype=np.float64)
+        phi_arr = np.asarray(phi, dtype=np.float64)
+        x, y = self.direction_to_pixel(lam_arr, phi_arr)
+
+        eps = 1e-6
+        return (
+            np.isfinite(lam_arr)
+            & np.isfinite(phi_arr)
+            & (x >= -eps)
+            & (x <= self.cfg.width - 1 + eps)
+            & (y >= -eps)
+            & (y <= self.cfg.height - 1 + eps)
+        )
+
+
+class Camera:
+    """Input camera wrapper preserving the downstream MaDCoW camera API."""
+
+    def __init__(self, cfg: CameraConfig) -> None:
+        """Initialize the selected input camera model."""
+        if cfg.width <= 0 or cfg.height <= 0:
+            raise ValueError(
+                f"width and height must be positive; got ({cfg.width}, {cfg.height})."
+            )
+
+        self.cfg = cfg
+        self.model = _normalize_model(cfg.model)
+        if self.model == "pinhole":
+            self._camera = _PinholeCamera(cfg)
+        else:
+            self._camera = _EquirectangularCamera(cfg)
+
+        self.focal_length = self._camera.focal_length
+        self.cx = self._camera.cx
+        self.cy = self._camera.cy
+
+    def pixel_to_direction(self, x: Array, y: Array) -> tuple[Array, Array]:
+        """Convert input image pixel coordinates to view-sphere directions."""
+        return self._camera.pixel_to_direction(x, y)
+
+    def direction_to_pixel(self, lam: Array, phi: Array) -> tuple[Array, Array]:
+        """Project view-sphere directions back to input pixel coordinates."""
+        return self._camera.direction_to_pixel(lam, phi)
+
+    def direction_in_fov(self, lam: Array, phi: Array) -> Array:
+        """Check whether view-sphere directions fall inside the input image domain."""
+        return self._camera.direction_in_fov(lam, phi)
+
+
 if __name__ == "__main__":
     cfg = CameraConfig(fov_deg=90, width=1920, height=1080)
     camera = Camera(cfg)
@@ -169,3 +270,17 @@ if __name__ == "__main__":
 
     in_fov = camera.direction_in_fov(lam, phi)
     print("in_fov shape, all inside?:", in_fov.shape, bool(in_fov.all()))
+
+    eq_cfg = CameraConfig(fov_deg=None, width=400, height=200, model="360")
+    eq_camera = Camera(eq_cfg)
+    xs = np.arange(eq_cfg.width)
+    ys = np.arange(eq_cfg.height)
+    x_grid, y_grid = np.meshgrid(xs, ys, indexing="xy")
+    lam, phi = eq_camera.pixel_to_direction(x_grid, y_grid)
+    x_back, y_back = eq_camera.direction_to_pixel(lam, phi)
+    print(
+        "360 round-trip max err:",
+        float(np.max(np.abs(x_back - x_grid))),
+        float(np.max(np.abs(y_back - y_grid))),
+    )
+    print("360 all inside?:", bool(eq_camera.direction_in_fov(lam, phi).all()))

@@ -1,5 +1,6 @@
 {
     "image_path": "test_1.png",
+    "camera_model": "pinhole",
     "fov_deg": 90.0,
     "lines": [],
     "regions": [
