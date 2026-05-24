@@ -13,7 +13,7 @@ initialization, then optimizes the full image warp with differentiable losses.
 ## Current Pipeline
 
 1. Load the input image, annotation JSON, and pipeline config.
-2. Build an input perspective camera from the image size and horizontal FOV.
+2. Build the input camera from the annotation's `camera_model`.
 3. Build the mesh from the input camera rays by sampling the image border and
    covering the resulting `(lambda, phi)` domain.
 4. Rasterize each ROI mask from input-image pixels onto the angular mesh.
@@ -34,7 +34,7 @@ initialization, then optimizes the full image warp with differentiable losses.
   settings.
 - `data/` - sample image, annotation JSON files, and ROI mask PNGs.
 - `outputs/` - generated example outputs.
-- `src/camera.py` - input perspective camera and pixel/ray conversion.
+- `src/camera.py` - input camera models and pixel/ray conversion.
 - `src/mesh.py` - angular mesh construction, valid-domain masks, ROI mask
   rasterization, and mesh sampling.
 - `src/projections.py` - stereographic, perspective, and per-ROI projection
@@ -50,14 +50,24 @@ initialization, then optimizes the full image warp with differentiable losses.
 ```bash
 ./.venv/bin/python -m MaDCoW.annotate \
     --image MaDCoW/data/test_1.png \
+    --camera-model pinhole \
     --fov 90 \
     --output-dir MaDCoW/data
 ```
 
-`--fov` is the horizontal FOV of the input image in degrees. If it is omitted,
-the tool tries to estimate it from EXIF metadata and falls back to 90 degrees.
-The GUI writes `<image_stem>.json` and one `mask_<roi>.png` file per non-empty
-ROI into the output directory.
+`--camera-model` must be either `pinhole` or `360`. The parser is strict:
+case variants and aliases are not accepted.
+
+For `pinhole`, `--fov` is the horizontal FOV of the input image in degrees. If
+it is omitted, the tool tries to estimate it from EXIF metadata and falls back
+to 90 degrees.
+
+For `360`, the input is treated as a full 360x180 equirectangular image. `--fov`
+is ignored, and the saved annotation does not contain `fov_deg`.
+
+The GUI also has camera radio buttons for `Pinhole` and `360`. The GUI writes
+`<image_stem>.json` and one `mask_<roi>.png` file per non-empty ROI into the
+output directory.
 
 Useful GUI controls:
 
@@ -73,6 +83,7 @@ Useful GUI controls:
 - `+` / `-`: change brush radius.
 - `u`: undo the last line or mask stroke.
 - `c`: clear the selected ROI.
+- Camera radio buttons: choose `Pinhole` or `360` before saving.
 - `s` or `Save`: save JSON and masks.
 
 ## Run Correction
@@ -91,14 +102,19 @@ the output is cropped to the largest black-border-free rectangle with the
 input aspect ratio. Because cropping uses the validity mask, legitimate black
 pixels in the input are not treated as borders.
 
+`main.py` does not provide a CLI flag for choosing the camera model. The camera
+model must already be present in the annotation JSON written by `annotate.py`.
+
 ## Annotation JSON
 
-The annotation file contains the input image path, input horizontal FOV,
-straight-line constraints, and ROI mask paths:
+The annotation file contains the input image path, input camera model,
+straight-line constraints, and ROI mask paths. Pinhole annotations also contain
+the input horizontal FOV:
 
 ```json
 {
     "image_path": "test_1.png",
+    "camera_model": "pinhole",
     "fov_deg": 90.0,
     "lines": [
         {
@@ -118,11 +134,25 @@ straight-line constraints, and ROI mask paths:
 }
 ```
 
+For a 360 equirectangular input, the annotation omits `fov_deg`:
+
+```json
+{
+    "image_path": "panorama.png",
+    "camera_model": "360",
+    "lines": [],
+    "regions": []
+}
+```
+
 Paths inside the JSON are resolved relative to the JSON file. Line samples are
 view-sphere directions in radians: `lambda` is yaw and `phi` is pitch. The
 annotated curve may appear curved in the input image, but it should represent
 a real-world straight structure. The output line loss forces the warped curve
 samples to become collinear.
+
+Annotations missing `camera_model` are rejected by `main.py`; the value is set
+only by `annotate.py`.
 
 ## Config
 
@@ -181,6 +211,7 @@ Several modules contain small executable self-checks:
 ./.venv/bin/python -m compileall MaDCoW
 ./.venv/bin/python -m MaDCoW.main --help
 ./.venv/bin/python -m MaDCoW.annotate --help
+./.venv/bin/python -m MaDCoW.src.camera
 ./.venv/bin/python -m MaDCoW.src.render
 ./.venv/bin/python -m MaDCoW.src.losses
 ./.venv/bin/python -m MaDCoW.src.stage2_warp
