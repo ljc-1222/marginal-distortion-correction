@@ -363,7 +363,7 @@ class AnnotationGUI:
 
         self.fig, self.ax = plt.subplots(figsize=(12, 8))
         self.fig.canvas.manager.set_window_title("MaDCoW Annotation Tool")
-        self.fig.subplots_adjust(left=0.03, right=0.99, bottom=0.18, top=0.94)
+        self.fig.subplots_adjust(left=0.03, right=0.99, bottom=0.25, top=0.94)
         self.ax.imshow(self.image)
         self.ax.set_xlim(-0.5, self.width - 0.5)
         self.ax.set_ylim(self.height - 0.5, -0.5)
@@ -374,31 +374,48 @@ class AnnotationGUI:
         self.status = self.fig.text(0.03, 0.965, "", ha="left", va="center", fontsize=10)
 
         self.widgets: list[Any] = []
-        buttons = [
-            ("Line", 0.03, self._button_line),
-            ("Region", 0.105, self._button_region),
-            ("New ROI", 0.195, self._button_new_region),
-            ("Prev", 0.295, self._button_prev_region),
-            ("Next", 0.36, self._button_next_region),
-            ("Brush -", 0.425, self._button_brush_down),
-            ("Brush +", 0.51, self._button_brush_up),
-            ("Undo", 0.595, self._button_undo),
-            ("Clear", 0.67, self._button_clear_region),
-            ("Save", 0.745, self._button_save),
-            ("Save+Close", 0.82, self._button_save_close),
-        ]
-        for label, x0, callback in buttons:
-            ax_button = self.fig.add_axes([x0, 0.045, 0.07, 0.045])
-            button = Button(ax_button, label)
-            button.on_clicked(callback)
-            self.widgets.append(button)
 
-        name_ax = self.fig.add_axes([0.12, 0.105, 0.28, 0.045])
+        def add_centered_button_row(buttons: list[tuple[str, float, Any]], y0: float) -> None:
+            gap = 0.018
+            total_width = sum(width for _label, width, _callback in buttons) + gap * (len(buttons) - 1)
+            x0 = (1.0 - total_width) * 0.5
+            for label, width, callback in buttons:
+                ax_button = self.fig.add_axes([x0, y0, width, 0.045])
+                button = Button(ax_button, label)
+                button.on_clicked(callback)
+                self.widgets.append(button)
+                x0 += width + gap
+
+        add_centered_button_row(
+            [
+                ("Line", 0.075, self._button_line),
+                ("Region", 0.085, self._button_region),
+                ("New ROI", 0.095, self._button_new_region),
+                ("Prev", 0.075, self._button_prev_region),
+                ("Next", 0.075, self._button_next_region),
+                ("Brush -", 0.085, self._button_brush_down),
+                ("Brush +", 0.085, self._button_brush_up),
+            ],
+            0.045,
+        )
+        add_centered_button_row(
+            [
+                ("Undo", 0.075, self._button_undo),
+                ("Clear", 0.075, self._button_clear_region),
+                ("Save", 0.075, self._button_save),
+                ("Save+Close", 0.120, self._button_save_close),
+            ],
+            0.105,
+        )
+
+        controls_width = 0.28 + 0.04 + 0.17
+        controls_x0 = (1.0 - controls_width) * 0.5
+        name_ax = self.fig.add_axes([controls_x0, 0.165, 0.28, 0.045])
         self.name_box = TextBox(name_ax, "ROI name", initial=self._current_region_data()["name"])
         self.name_box.on_submit(self._on_name_submit)
         self.widgets.append(self.name_box)
 
-        camera_ax = self.fig.add_axes([0.43, 0.105, 0.17, 0.06])
+        camera_ax = self.fig.add_axes([controls_x0 + 0.32, 0.158, 0.17, 0.06])
         labels = [CAMERA_MODEL_LABELS[model] for model in CAMERA_MODEL_CHOICES]
         active = CAMERA_MODEL_CHOICES.index(self.camera_model)
         self.camera_selector = RadioButtons(camera_ax, labels, active=active)
