@@ -1,0 +1,5 @@
+{
+    "score_thresh": 0.5,
+    "top_k": 30,
+    "duplicate_dist_px": 6.0
+}
