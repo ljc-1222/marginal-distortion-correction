@@ -242,10 +242,14 @@ def smoothness_loss(
         raise ValueError(f"w must have shape {(H, W)}; got {tuple(weight.shape)}.")
     valid_vertices = _bool_mask_tensor(valid_mask, p, (H, W), "valid_mask")
 
-    u_xx = (u[:-1, 2:] - 2.0 * u[:-1, 1:-1] + u[:-1, :-2]) / (delta_lambda * delta_lambda)
-    v_xx = (v[:-1, 2:] - 2.0 * v[:-1, 1:-1] + v[:-1, :-2]) / (delta_lambda * delta_lambda)
-    u_xy = (u[1:, 2:] - u[1:, 1:-1] - u[:-1, 2:] + u[:-1, 1:-1]) / (delta_phi * delta_lambda)
-    v_xy = (v[1:, 2:] - v[1:, 1:-1] - v[:-1, 2:] + v[:-1, 1:-1]) / (delta_phi * delta_lambda)
+    # u_xx = (u[:-1, 2:] - 2.0 * u[:-1, 1:-1] + u[:-1, :-2]) / (delta_lambda * delta_lambda)
+    # v_xx = (v[:-1, 2:] - 2.0 * v[:-1, 1:-1] + v[:-1, :-2]) / (delta_lambda * delta_lambda)
+    # u_xy = (u[1:, 2:] - u[1:, 1:-1] - u[:-1, 2:] + u[:-1, 1:-1]) / (delta_phi * delta_lambda)
+    # v_xy = (v[1:, 2:] - v[1:, 1:-1] - v[:-1, 2:] + v[:-1, 1:-1]) / (delta_phi * delta_lambda)
+    u_xx = (u[:-1, 2:] - 2.0 * u[:-1, 1:-1] + u[:-1, :-2])
+    v_xx = (v[:-1, 2:] - 2.0 * v[:-1, 1:-1] + v[:-1, :-2])
+    u_xy = (u[1:, 2:] - u[1:, 1:-1] - u[:-1, 2:] + u[:-1, 1:-1])
+    v_xy = (v[1:, 2:] - v[1:, 1:-1] - v[:-1, 2:] + v[:-1, 1:-1])
 
     cos_phi = torch.cos(phi[:-1, 1:-1])
     weight_sq = weight[:-1, 1:-1] * weight[:-1, 1:-1]
