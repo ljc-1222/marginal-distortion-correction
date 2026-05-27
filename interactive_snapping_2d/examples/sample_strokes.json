@@ -1,0 +1,10 @@
+{
+  "strokes": [
+    {
+      "name": "sample_rough_line",
+      "points": [[100, 100], [140, 120], [180, 150]],
+      "mode": "line",
+      "camera_type": "panorama"
+    }
+  ]
+}
