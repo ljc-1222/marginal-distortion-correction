@@ -118,7 +118,6 @@ def conformal_loss(
     u = p[..., 0]
     v = p[..., 1]
     phi = _mesh_phi_tensor(mesh, p)
-    delta_lambda, delta_phi = mesh_angular_steps(mesh)
 
     weight = torch.as_tensor(w, dtype=p.dtype, device=p.device)
     if weight.shape != (H, W):
@@ -126,10 +125,10 @@ def conformal_loss(
     vertex = _bool_mask_tensor(vertex_mask, p, (H, W), "vertex_mask")
     valid_vertices = _bool_mask_tensor(valid_mask, p, (H, W), "valid_mask")
 
-    du_dphi = (u[1:, :-1] - u[:-1, :-1]) / delta_phi
-    dv_dphi = (v[1:, :-1] - v[:-1, :-1]) / delta_phi
-    du_dlambda = (u[:-1, 1:] - u[:-1, :-1]) / delta_lambda
-    dv_dlambda = (v[:-1, 1:] - v[:-1, :-1]) / delta_lambda
+    du_dphi = (u[1:, :-1] - u[:-1, :-1])
+    dv_dphi = (v[1:, :-1] - v[:-1, :-1])
+    du_dlambda = (u[:-1, 1:] - u[:-1, :-1])
+    dv_dlambda = (v[:-1, 1:] - v[:-1, :-1])
 
     cos_phi = torch.cos(phi[:-1, :-1])
     weight_sq = weight[:-1, :-1] * weight[:-1, :-1]
@@ -236,16 +235,11 @@ def smoothness_loss(
     u = p[..., 0]
     v = p[..., 1]
     phi = _mesh_phi_tensor(mesh, p)
-    delta_lambda, delta_phi = mesh_angular_steps(mesh)
     weight = torch.as_tensor(w, dtype=p.dtype, device=p.device)
     if weight.shape != (H, W):
         raise ValueError(f"w must have shape {(H, W)}; got {tuple(weight.shape)}.")
     valid_vertices = _bool_mask_tensor(valid_mask, p, (H, W), "valid_mask")
 
-    # u_xx = (u[:-1, 2:] - 2.0 * u[:-1, 1:-1] + u[:-1, :-2]) / (delta_lambda * delta_lambda)
-    # v_xx = (v[:-1, 2:] - 2.0 * v[:-1, 1:-1] + v[:-1, :-2]) / (delta_lambda * delta_lambda)
-    # u_xy = (u[1:, 2:] - u[1:, 1:-1] - u[:-1, 2:] + u[:-1, 1:-1]) / (delta_phi * delta_lambda)
-    # v_xy = (v[1:, 2:] - v[1:, 1:-1] - v[:-1, 2:] + v[:-1, 1:-1]) / (delta_phi * delta_lambda)
     u_xx = (u[:-1, 2:] - 2.0 * u[:-1, 1:-1] + u[:-1, :-2])
     v_xx = (v[:-1, 2:] - 2.0 * v[:-1, 1:-1] + v[:-1, :-2])
     u_xy = (u[1:, 2:] - u[1:, 1:-1] - u[:-1, 2:] + u[:-1, 1:-1])
