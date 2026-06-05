@@ -1,4 +1,4 @@
-"""JSON import/export helpers for snapped 2D and MaDCoW annotations."""
+"""MaDCoW JSON export helpers for snapped 2D annotations."""
 
 from __future__ import annotations
 
@@ -16,14 +16,7 @@ from MaDCoW.src import CameraConfig
 from MaDCoW.src.camera import Camera
 
 
-SCHEMA_VERSION = "0.1.0"
-TOOL_NAME = "interactive_snapping_2d"
 MADCOW_LINE_POINTS = 128
-
-
-def _points_to_list(points: np.ndarray) -> list[list[float]]:
-    arr = np.asarray(points, dtype=np.float32)
-    return [[float(x), float(y)] for x, y in arr]
 
 
 def _relative_path(path: Path, base_dir: Path) -> str:
@@ -32,38 +25,6 @@ def _relative_path(path: Path, base_dir: Path) -> str:
         return str(path.resolve().relative_to(base_dir.resolve()))
     except ValueError:
         return os.path.relpath(path.resolve(), base_dir.resolve())
-
-
-def result_to_json_dict(result: SnapResult, image_path: str) -> dict[str, Any]:
-    """Convert a :class:`SnapResult` to the public JSON schema."""
-    debug_summary = {
-        "mean_edge_score": float(result.debug.get("mean_edge_score", 0.0)),
-        "mean_orientation_score": float(result.debug.get("mean_orientation_score", 0.0)),
-        "mean_abs_offset_px": float(result.debug.get("mean_abs_offset_px", 0.0)),
-    }
-    return {
-        "version": SCHEMA_VERSION,
-        "tool": TOOL_NAME,
-        "image_path": str(image_path),
-        "coordinate_space": "input_image_pixel",
-        "camera_type": result.camera_type,
-        "mode": result.mode,
-        "points": _points_to_list(result.points),
-        "source_stroke": _points_to_list(result.source_stroke),
-        "closed": False,
-        "confidence": float(result.confidence),
-        "debug_summary": debug_summary,
-    }
-
-
-def save_annotation_json(result: SnapResult, image_path: str, output_path: str) -> None:
-    """Save a snapped 2D annotation JSON file."""
-    path = Path(output_path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    data = result_to_json_dict(result, image_path)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
-        f.write("\n")
 
 
 def _resample_to_count(points: np.ndarray, n_samples: int) -> np.ndarray:
@@ -178,19 +139,3 @@ def save_madcow_annotation_json(
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=4)
         f.write("\n")
-
-
-def load_strokes_json(path: str) -> list[dict[str, Any]]:
-    """Load rough strokes from a JSON file with a top-level ``strokes`` list."""
-    with open(path, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    strokes = data.get("strokes")
-    if not isinstance(strokes, list) or not strokes:
-        raise ValueError(f"{path} must contain a non-empty 'strokes' list.")
-    for idx, item in enumerate(strokes):
-        if not isinstance(item, dict):
-            raise ValueError(f"strokes[{idx}] must be an object.")
-        points = item.get("points")
-        if not isinstance(points, list) or len(points) < 2:
-            raise ValueError(f"strokes[{idx}].points must contain at least two points.")
-    return strokes

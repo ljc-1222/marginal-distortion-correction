@@ -1,27 +1,30 @@
 # Interactive Snapping 2D
 
-`interactive_snapping_2d/` is an annotation frontend for snapping a rough
-mouse stroke to nearby 2D image evidence. It outputs image-space points:
-
-```json
-[[123.4, 512.8], [124.9, 511.6], [126.2, 510.1]]
-```
+`interactive_snapping_2d/` is a MaDCoW annotation frontend for snapping a rough
+mouse stroke to nearby 2D image evidence and exporting `lines[].points_dir`.
 
 It does not run MaDCoW optimization, ROI correction, image warping, ULSD, or
-full-image line detection. Downstream code can convert the 2D points to
-longitude/latitude or view-sphere coordinates before marginal distortion
-correction.
+full-image line detection. It only writes the annotation JSON consumed by
+`MaDCoW/main.py`.
 
 ## Algorithm
 
-The snapper uses a local 2D ribbon around the user stroke:
+The snapper routes by annotation mode. `camera_type` only controls panorama
+seam unwrap/wrap; it does not change the geometry contract of `line` or
+`curve`.
 
 1. Clean, smooth, and uniformly resample the rough stroke.
-2. Compute local edge strength with OpenCV gradients and optional Canny edges.
-3. Build candidate points along each stroke normal.
-4. Use dynamic programming to choose a low-cost path with edge, distance,
-   orientation, and smoothness terms.
-5. Postprocess the selected path according to camera type and annotation mode.
+2. Compute local edge evidence with multi-scale gradients, Canny edges, edge
+   tangent direction, and Lab color contrast across candidate normals.
+3. For `line`, fit an initial 2D line from the rough stroke, search nearby
+   angle/rho candidates, score each angle's rho candidates in a vectorized
+   batch by edge, orientation-gated edge evidence, color contrast, continuity,
+   and distance to the rough stroke, then robustly refit and output exact
+   collinear line samples.
+4. For `curve`, extract local normal-profile peaks, optionally score paired
+   edges around a wide band center, run peak-level dynamic programming with
+   offset jump, polarity, orientation, and curvature penalties, apply subpixel
+   peak refinement, then smooth and resample the curve.
 
 The public API is:
 
@@ -34,13 +37,11 @@ points_xy = result.points
 
 ## Modes
 
-- `curve`: keeps the snapped 2D curve shape, then lightly smooths and resamples
-  it.
-- `line` with `pinhole`: fits a 2D image-space straight line to the snapped
-  path and samples only within the user stroke extent.
-- `line` with `panorama`: keeps a 2D polyline. It does not force an
-  equirectangular panorama line annotation to become a straight image-space
-  line.
+- `line`: always outputs a geometrically exact 2D straight line segment in
+  input-image pixel coordinates. This is true for both `pinhole` and
+  `panorama`.
+- `curve`: outputs 2D curve samples that snap to nearby image boundaries rather
+  than only smoothing the user's stroke.
 
 ## Camera Types
 
@@ -53,70 +54,57 @@ points_xy = result.points
 
 ```bash
 ./.venv/bin/python -m interactive_snapping_2d.annotate_line_aid \
-    --image interactive_snapping_2d/data/test_1.jpg
+    --image interactive_snapping_2d/data/test_1.jpg \
+    --config-json interactive_snapping_2d/config/snap_config.json
 ```
 
 Mouse and keyboard controls:
 
-- `Draw` button: enter rough-stroke drawing mode.
-- Left drag in `Draw` mode: draw a rough stroke; mouse release snaps it into a selected candidate line.
-- `Review` button: enter candidate review mode.
-- Left click a candidate in `Review` mode: toggle selected/dropped.
-- `Select All`, `Drop All`, `Invert`: batch-edit candidate selection.
-- `Undo`: remove the most recently created snapped candidate.
-- `Reset`: reset only the current in-progress stroke.
-- `S`: save a MaDCoW-compatible annotation JSON, a 2D debug JSON, and a preview PNG.
-- `P`: use `pinhole`.
-- `E`: use `panorama`.
-- `L`: use `line`.
-- `C`: use `curve`.
-- `D`: toggle debug edge overlay.
-- `ESC`: reset the current stroke.
+- `Camera`: choose `pinhole` or `panorama`.
+- `Type`: choose `line` or `curve`.
+- Left drag: draw a rough stroke; mouse release snaps it with the selected
+  camera and mode.
+- `Redraw`: discard the pending snapped result and draw again.
+- `Next`: accept the pending snapped result and start the next annotation.
+- `Save`: accept any pending result, then save a MaDCoW-compatible annotation
+  JSON.
+- `Save + Close`: save the annotation JSON and close the GUI after a successful
+  save.
+- `R` or `ESC`: discard the pending result or current stroke.
+- `N`, `Enter`, or `Space`: accept the pending snapped result.
+- `S`, `Ctrl+S`, or `Cmd+S`: save.
 
-The default saved annotation is compatible with `MaDCoW/main.py`: it contains
-`image_path`, `camera_model`, optional `fov_deg`, `lines[].points_dir` with
-128 view-sphere samples, and an empty `regions` list. The snapping debug JSON
-keeps the 2D image-space points.
+The default MaDCoW annotation is compatible with `MaDCoW/main.py`: it contains
+`image_path`, `camera_model`, pinhole `fov_deg`, `lines[].points_dir` with 128
+view-sphere samples, and an empty `regions` list. Use one camera type per saved
+MaDCoW file; the MaDCoW export uses the current global `Camera` setting.
 
-## CLI Demo
+## Snap Parameters
 
-```bash
-./.venv/bin/python -m interactive_snapping_2d.demo_cli \
-    --image interactive_snapping_2d/data/test_1.jpg \
-    --stroke-json interactive_snapping_2d/examples/sample_strokes.json \
-    --camera-type panorama \
-    --mode line \
-    --output-json interactive_snapping_2d/outputs/demo_annotation.json \
-    --output-madcow-json interactive_snapping_2d/outputs/demo_madcow_annotation.json \
-    --output-preview interactive_snapping_2d/outputs/demo_preview.png
+Default GUI parameters are stored in:
+
+```text
+interactive_snapping_2d/config/snap_config.json
 ```
+
+The current curve defaults keep `profile_top_k=11` so real edges are not
+dropped from the candidate set. They smooth the selected normal-offset sequence
+(`offset_smooth_window=13`, `offset_smooth_passes=2`) before final curve
+construction, then apply a lower cutoff output smoother
+(`output_smooth_window=15`, `output_smooth_passes=3`) to suppress remaining
+high-frequency jitter. The `normal_gradient_consistency_*` parameters can run a
+second curve-DP pass that penalizes reliable normal-gradient sign changes,
+which is useful for testing same-side snapping on thick objects. It defaults to
+`0.0` because the current real-image ablation favored offset smoothing as the
+default same-side stabilizer. The
+`band_center_*` parameters are available for wide shadow or thick-line cases,
+but `band_center_weight` also defaults to `0.0` because the current real-image
+ablation did not justify the extra runtime as a default.
 
 ## JSON Output
 
-The exported schema keeps the core output in 2D input-image pixels:
-
-```json
-{
-  "version": "0.1.0",
-  "tool": "interactive_snapping_2d",
-  "image_path": "interactive_snapping_2d/data/test_1.jpg",
-  "coordinate_space": "input_image_pixel",
-  "camera_type": "panorama",
-  "mode": "line",
-  "points": [[123.4, 512.8], [124.9, 511.6]],
-  "source_stroke": [[120.0, 515.0], [130.0, 508.0]],
-  "closed": false,
-  "confidence": 0.86,
-  "debug_summary": {
-    "mean_edge_score": 0.72,
-    "mean_orientation_score": 0.81,
-    "mean_abs_offset_px": 5.2
-  }
-}
-```
-
-For MaDCoW, use the optional MaDCoW export. It converts the 2D snapped line to
-the current `main.py` schema:
+Save writes `<stem>.json` in the output directory. It converts the 2D snapped
+annotations to the current `main.py` schema:
 
 ```json
 {
@@ -129,12 +117,6 @@ the current `main.py` schema:
   ],
   "regions": []
 }
-```
-
-## Tests
-
-```bash
-./.venv/bin/python -m pytest interactive_snapping_2d/tests
 ```
 
 ## Known Limitations

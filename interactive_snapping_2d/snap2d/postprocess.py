@@ -52,7 +52,11 @@ def postprocess_curve(points: np.ndarray, config: SnapConfig) -> np.ndarray:
     """Lightly smooth and resample a snapped curve."""
     if len(points) < 3:
         return points.astype(np.float32, copy=True)
-    smoothed = smooth_polyline(points, window=max(3, int(config.smooth_window)), passes=1)
+    smoothed = smooth_polyline(
+        points,
+        window=max(3, int(config.output_smooth_window)),
+        passes=max(0, int(config.output_smooth_passes)),
+    )
     return _resample_output(smoothed, config)
 
 
@@ -62,7 +66,7 @@ def postprocess_pinhole_line(
     weights: np.ndarray,
     config: SnapConfig,
 ) -> np.ndarray:
-    """Fit and sample a 2D straight line for pinhole line annotations."""
+    """Fit and sample a 2D straight line annotation."""
     line_point, direction = fit_weighted_line_2d(points, weights)
     source = np.asarray(source_stroke, dtype=np.float32)
     if np.dot(direction, source[-1] - source[0]) < 0:
@@ -93,6 +97,6 @@ def postprocess_annotation(
 ) -> np.ndarray:
     """Apply mode-specific output postprocessing."""
     weights = np.asarray(debug.get("edge_scores", np.ones(len(points))), dtype=np.float32)
-    if mode == "line" and camera_type == "pinhole":
+    if mode == "line":
         return postprocess_pinhole_line(points, source_stroke, weights, config)
     return postprocess_curve(points, config)

@@ -3,23 +3,20 @@
 from __future__ import annotations
 
 import argparse
-import json
 import math
 import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-import cv2
 import numpy as np
 from PIL import ExifTags, Image
 
-from .snap2d import SnapConfig, SnapResult, snap_annotation
+from .snap2d import SnapConfig, SnapResult, load_snap_config, snap_annotation
 from .snap2d.io import save_madcow_annotation_json
 
 
 DEFAULT_IMAGE = Path(__file__).resolve().parent / "data" / "test_1.jpg"
-DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parent / "outputs"
 FALLBACK_FOV_DEG = 90.0
 PREVIEW_MAX_SIDE = 1200
 STROKE_MIN_SPACING_PX = 3.0
@@ -123,12 +120,35 @@ def _normalize_camera_type(camera_type: str) -> str:
     return camera_type
 
 
-def _draw_polyline(image: np.ndarray, points: np.ndarray, color: tuple[int, int, int], thickness: int) -> None:
-    """Draw one polyline on a BGR image."""
-    if len(points) < 2:
+def _center_figure_window(fig: Any) -> None:
+    """Center the Matplotlib figure window when the active backend exposes window geometry."""
+    manager = getattr(getattr(fig, "canvas", None), "manager", None)
+    window = getattr(manager, "window", None)
+    if window is None:
         return
-    pts = np.round(points).astype(np.int32).reshape(-1, 1, 2)
-    cv2.polylines(image, [pts], False, color, thickness, lineType=cv2.LINE_AA)
+
+    try:
+        if hasattr(window, "wm_geometry"):
+            window.update_idletasks()
+            width = int(window.winfo_width())
+            height = int(window.winfo_height())
+            screen_width = int(window.winfo_screenwidth())
+            screen_height = int(window.winfo_screenheight())
+            x = max(0, (screen_width - width) // 2)
+            y = max(0, (screen_height - height) // 2)
+            window.wm_geometry(f"+{x}+{y}")
+            return
+
+        if hasattr(window, "frameGeometry") and hasattr(window, "move"):
+            frame = window.frameGeometry()
+            screen = window.screen() if hasattr(window, "screen") else None
+            available = screen.availableGeometry() if screen is not None else None
+            if available is None:
+                return
+            frame.moveCenter(available.center())
+            window.move(frame.topLeft())
+    except Exception:
+        return
 
 
 @dataclass
@@ -152,6 +172,7 @@ class LineAidAnnotationGUI:
         fov_deg: float | None,
         output_dir: str,
         camera_type: str = "pinhole",
+        snap_config: SnapConfig | None = None,
     ) -> None:
         self.image_path = str(Path(image_path).resolve())
         self.camera_type = _normalize_camera_type(camera_type)
@@ -160,6 +181,7 @@ class LineAidAnnotationGUI:
             self.fov_deg = FALLBACK_FOV_DEG
         if self.fov_deg is not None and (self.fov_deg <= 0 or self.fov_deg >= 180):
             raise ValueError(f"fov_deg must lie in (0, 180); got {self.fov_deg}.")
+        self.snap_config = snap_config or SnapConfig()
 
         self.output_dir = Path(output_dir).resolve()
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -188,8 +210,6 @@ class LineAidAnnotationGUI:
 
         stem = Path(self.image_path).stem
         self.json_path = self.output_dir / f"{stem}.json"
-        self.snap_json_path = self.output_dir / f"{stem}_snapping_2d.json"
-        self.preview_path = self.output_dir / f"{stem}_snapping_preview.png"
 
         self._build_figure()
         self._refresh()
@@ -256,6 +276,7 @@ class LineAidAnnotationGUI:
         self.fig.canvas.mpl_connect("motion_notify_event", self._on_motion)
         self.fig.canvas.mpl_connect("button_release_event", self._on_release)
         self.fig.canvas.mpl_connect("key_press_event", self._on_key)
+        _center_figure_window(self.fig)
 
     def _on_camera_changed(self, label: str) -> None:
         """Set the global camera type and resnap the pending stroke if present."""
@@ -418,7 +439,7 @@ class LineAidAnnotationGUI:
                 stroke_original,
                 camera_type=self.camera_type,
                 mode=self.snap_mode,
-                config=SnapConfig(),
+                config=self.snap_config,
             )
             self.pending = AnnotationItem(
                 result=result,
@@ -469,9 +490,6 @@ class LineAidAnnotationGUI:
             self.status_extra = "Nothing to save. Draw at least one annotation first."
             return False
 
-        self.snap_json_path.write_text(json.dumps(self._build_2d_payload(), indent=2), encoding="utf-8")
-        self._save_preview(self.annotations, self.preview_path)
-
         madcow_status = "MaDCoW JSON written"
         try:
             save_madcow_annotation_json(
@@ -485,47 +503,8 @@ class LineAidAnnotationGUI:
         except Exception as exc:
             madcow_status = f"MaDCoW JSON not written: {exc}"
 
-        self.status_extra = (
-            f"Saved {len(results)} annotation(s). 2D JSON: {self.snap_json_path}; "
-            f"preview: {self.preview_path}; {madcow_status}."
-        )
+        self.status_extra = f"Saved {len(results)} annotation(s). {madcow_status}: {self.json_path}."
         return True
-
-    def _build_2d_payload(self) -> dict[str, Any]:
-        """Build the authoritative 2D annotation payload."""
-        return {
-            "version": "0.2.0",
-            "tool": "interactive_snapping_2d_simple",
-            "image_path": self.image_path,
-            "coordinate_space": "input_image_pixel",
-            "image_shape": [int(self.original_height), int(self.original_width)],
-            "camera_type": self.camera_type,
-            "fov_deg": None if self.fov_deg is None else float(self.fov_deg),
-            "annotations": [
-                {
-                    "id": f"anno_{idx:03d}",
-                    "mode": item.snap_mode,
-                    "camera_type": item.camera_type,
-                    "points": item.result.points.astype(float).tolist(),
-                    "source_stroke": item.result.source_stroke.astype(float).tolist(),
-                    "confidence": float(item.result.confidence),
-                }
-                for idx, item in enumerate(self.annotations, start=1)
-            ],
-        }
-
-    def _save_preview(self, items: list[AnnotationItem], path: Path) -> None:
-        """Save an RGB overlay preview image."""
-        preview = cv2.cvtColor(self.original_image, cv2.COLOR_RGB2BGR)
-        for idx, item in enumerate(items, start=1):
-            _draw_polyline(preview, item.result.source_stroke, (0, 255, 255), 2)
-            _draw_polyline(preview, item.result.points, (0, 0, 255), 3)
-            x, y = np.round(item.result.points[-1]).astype(int)
-            label = f"{idx}:{item.snap_mode[0].upper()}"
-            cv2.putText(preview, label, (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 3, cv2.LINE_AA)
-            cv2.putText(preview, label, (x, y), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 1, cv2.LINE_AA)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        cv2.imwrite(str(path), preview)
 
     def _refresh(self) -> None:
         """Redraw accepted annotations, pending result, current stroke, and status."""
@@ -616,7 +595,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-dir",
         default=None,
-        help="Where to save JSON and preview PNG files. Defaults to the input image directory.",
+        help="Where to save the MaDCoW annotation JSON. Defaults to the input image directory.",
+    )
+    parser.add_argument(
+        "--config-json",
+        default=None,
+        help="Optional snap parameter JSON path. Defaults to interactive_snapping_2d/config/snap_config.json.",
     )
     return parser.parse_args()
 
@@ -638,7 +622,8 @@ def main() -> None:
             print("Using panorama camera type.")
 
     output_dir = args.output_dir or str(image_path.parent)
-    LineAidAnnotationGUI(str(image_path), fov, output_dir, camera_type=camera_type).run()
+    snap_config = load_snap_config(args.config_json)
+    LineAidAnnotationGUI(str(image_path), fov, output_dir, camera_type=camera_type, snap_config=snap_config).run()
 
 
 if __name__ == "__main__":
