@@ -23,6 +23,14 @@ STROKE_MIN_SPACING_PX = 3.0
 CAMERA_TYPE_CHOICES = ("pinhole", "panorama")
 SNAP_MODE_CHOICES = ("line", "curve")
 
+STATE_CAMERA_SELECT = "camera_select"
+STATE_PANORAMA_SETUP = "panorama_setup"
+STATE_ANNOTATE = "annotate"
+
+MIN_CROP_FRACTION = 0.08
+CROP_EDGE_HIT_PX = 10.0
+PANORAMA_MAX_ABS_PITCH = (math.pi / 2.0) - 1e-4
+
 if "MPLCONFIGDIR" not in os.environ:
     mpl_config_dir = Path("/tmp") / "interactive_snapping_2d_matplotlib"
     mpl_config_dir.mkdir(parents=True, exist_ok=True)
@@ -120,6 +128,119 @@ def _normalize_camera_type(camera_type: str) -> str:
     return camera_type
 
 
+def _wrap_angle(angle: float) -> float:
+    """Wrap an angle to [-pi, pi)."""
+    return (float(angle) + math.pi) % (2.0 * math.pi) - math.pi
+
+
+def _equirect_pixel_to_angles(x: np.ndarray, y: np.ndarray, width: int, height: int) -> tuple[np.ndarray, np.ndarray]:
+    """Convert equirectangular pixel coordinates to yaw and pitch angles."""
+    if width < 2 or height < 2:
+        raise ValueError(f"Panorama view requires width and height of at least 2; got {width}x{height}.")
+    lam = (x / float(width - 1)) * (2.0 * math.pi) - math.pi
+    phi = (y / float(height - 1)) * math.pi - (math.pi / 2.0)
+    return lam, phi
+
+
+def _angles_to_equirect_pixel(
+    lam: np.ndarray,
+    phi: np.ndarray,
+    width: int,
+    height: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Project yaw and pitch angles to equirectangular pixel coordinates."""
+    x = ((lam + math.pi) / (2.0 * math.pi)) * float(width - 1)
+    y = ((phi + (math.pi / 2.0)) / math.pi) * float(height - 1)
+    return x, y
+
+
+def _angles_to_vectors(lam: np.ndarray, phi: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Convert yaw and pitch angles to unit-sphere vectors."""
+    cos_phi = np.cos(phi)
+    x = np.sin(lam) * cos_phi
+    y = np.sin(phi)
+    z = np.cos(lam) * cos_phi
+    return x, y, z
+
+
+def _vectors_to_angles(x: np.ndarray, y: np.ndarray, z: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Convert unit-sphere vectors to yaw and pitch angles."""
+    lam = np.arctan2(x, z)
+    phi = np.arctan2(y, np.sqrt((x * x) + (z * z)))
+    return lam, phi
+
+
+def _local_to_world_angles(
+    local_lam: np.ndarray,
+    local_phi: np.ndarray,
+    center_lam: float,
+    center_phi: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Map local equirectangular angles to world panorama angles."""
+    x, y, z = _angles_to_vectors(local_lam, local_phi)
+
+    cp = math.cos(-center_phi)
+    sp = math.sin(-center_phi)
+    y_pitch = (y * cp) - (z * sp)
+    z_pitch = (y * sp) + (z * cp)
+
+    cy = math.cos(center_lam)
+    sy = math.sin(center_lam)
+    x_world = (x * cy) + (z_pitch * sy)
+    z_world = (-x * sy) + (z_pitch * cy)
+    return _vectors_to_angles(x_world, y_pitch, z_world)
+
+
+def _world_to_local_angles(
+    world_lam: np.ndarray,
+    world_phi: np.ndarray,
+    center_lam: float,
+    center_phi: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Map world panorama angles to local equirectangular view angles."""
+    x, y, z = _angles_to_vectors(world_lam, world_phi)
+
+    cy = math.cos(-center_lam)
+    sy = math.sin(-center_lam)
+    x_yaw = (x * cy) + (z * sy)
+    z_yaw = (-x * sy) + (z * cy)
+
+    cp = math.cos(center_phi)
+    sp = math.sin(center_phi)
+    y_local = (y * cp) - (z_yaw * sp)
+    z_local = (y * sp) + (z_yaw * cp)
+    return _vectors_to_angles(x_yaw, y_local, z_local)
+
+
+def _remap_panorama_preview(
+    source_image: np.ndarray,
+    center_lam: float,
+    center_phi: float,
+    out_width: int | None = None,
+    out_height: int | None = None,
+) -> np.ndarray:
+    """Render a local equirectangular panorama preview for the selected center."""
+    import cv2
+
+    arr = np.asarray(source_image)
+    if arr.ndim < 2:
+        raise ValueError(f"source_image must have at least two dimensions; got {arr.shape}.")
+    src_height, src_width = arr.shape[:2]
+    dst_width = src_width if out_width is None else int(out_width)
+    dst_height = src_height if out_height is None else int(out_height)
+    yy, xx = np.indices((dst_height, dst_width), dtype=np.float64)
+    local_lam, local_phi = _equirect_pixel_to_angles(xx, yy, dst_width, dst_height)
+    world_lam, world_phi = _local_to_world_angles(local_lam, local_phi, center_lam, center_phi)
+    source_x, source_y = _angles_to_equirect_pixel(world_lam, world_phi, src_width, src_height)
+    return cv2.remap(
+        arr,
+        source_x.astype(np.float32),
+        source_y.astype(np.float32),
+        interpolation=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_WRAP,
+    )
+
+
 def _center_figure_window(fig: Any) -> None:
     """Center the Matplotlib figure window when the active backend exposes window geometry."""
     manager = getattr(getattr(fig, "canvas", None), "manager", None)
@@ -153,7 +274,7 @@ def _center_figure_window(fig: Any) -> None:
 
 @dataclass
 class AnnotationItem:
-    """One annotation stored by the simplified GUI."""
+    """One annotation stored by the GUI."""
 
     result: SnapResult
     preview_points: np.ndarray
@@ -164,7 +285,7 @@ class AnnotationItem:
 
 
 class LineAidAnnotationGUI:
-    """Minimal annotation GUI with draw, redraw, next, save, and save+close actions."""
+    """Line annotation GUI with camera selection and panorama view setup."""
 
     def __init__(
         self,
@@ -175,10 +296,9 @@ class LineAidAnnotationGUI:
         snap_config: SnapConfig | None = None,
     ) -> None:
         self.image_path = str(Path(image_path).resolve())
-        self.camera_type = _normalize_camera_type(camera_type)
+        self.initial_camera_type = _normalize_camera_type(camera_type)
+        self.camera_type: str | None = None
         self.fov_deg = None if fov_deg is None else float(fov_deg)
-        if self.camera_type == "pinhole" and self.fov_deg is None:
-            self.fov_deg = FALLBACK_FOV_DEG
         if self.fov_deg is not None and (self.fov_deg <= 0 or self.fov_deg >= 180):
             raise ValueError(f"fov_deg must lie in (0, 180); got {self.fov_deg}.")
         self.snap_config = snap_config or SnapConfig()
@@ -196,23 +316,41 @@ class LineAidAnnotationGUI:
                 else original_image.resize(preview_size, _lanczos_resampling())
             )
             self.original_image = np.array(original_image)
-            self.image = np.array(preview_image)
+            self.preview_image = np.array(preview_image)
 
-        self.height, self.width = self.image.shape[:2]
-        self.is_downsampled = self.width != self.original_width or self.height != self.original_height
+        self.preview_height, self.preview_width = self.preview_image.shape[:2]
+        self.is_downsampled = (
+            self.preview_width != self.original_width or self.preview_height != self.original_height
+        )
+        self.state = STATE_CAMERA_SELECT
         self.snap_mode = "line"
         self.annotations: list[AnnotationItem] = []
         self.pending: AnnotationItem | None = None
         self.current_stroke: list[tuple[float, float]] = []
         self._drawing_stroke = False
+        self._drag_action: str | None = None
+        self._drag_start_xy: tuple[float, float] | None = None
+        self._drag_start_center: tuple[float, float] | None = None
+        self._drag_start_crop: tuple[float, float, float, float] | None = None
         self._dynamic_artists: list[Any] = []
-        self.status_extra = "Draw a rough stroke. Then choose Redraw or Next."
+        self.status_extra = "Choose a camera mode."
+
+        self.panorama_center_lam = 0.0
+        self.panorama_center_phi = 0.0
+        self.panorama_setup_image: np.ndarray | None = None
+        self.panorama_crop_box = self._default_crop_box()
+        self.annotation_image: np.ndarray | None = None
+        self.annotation_setup_image: np.ndarray | None = None
+        self.annotation_center_lam = 0.0
+        self.annotation_center_phi = 0.0
+        self.annotation_crop_box = self.panorama_crop_box
+        self.annotation_crop_origin = (0.0, 0.0)
 
         stem = Path(self.image_path).stem
         self.json_path = self.output_dir / f"{stem}.json"
 
         self._build_figure()
-        self._refresh()
+        self._show_camera_select()
 
     def run(self) -> None:
         """Open the Matplotlib GUI and block until it closes."""
@@ -221,56 +359,23 @@ class LineAidAnnotationGUI:
         plt.show()
 
     def _build_figure(self) -> None:
-        """Create the simplified figure, controls, and event callbacks."""
+        """Create the figure, controls, and event callbacks."""
         import matplotlib.pyplot as plt
-        from matplotlib.widgets import Button, RadioButtons
 
         self.fig, self.ax = plt.subplots(figsize=(12, 8))
         self.fig.canvas.manager.set_window_title("2D Interactive Snapping Annotation")
-        self.fig.subplots_adjust(left=0.03, right=0.99, bottom=0.20, top=0.92)
-        self.image_artist = self.ax.imshow(self.image)
-        self.ax.set_xlim(-0.5, self.width - 0.5)
-        self.ax.set_ylim(self.height - 0.5, -0.5)
+        self.fig.subplots_adjust(left=0.03, right=0.99, bottom=0.18, top=0.92)
+        self.blank_image = np.full((max(1, self.preview_height), max(1, self.preview_width), 3), 245, dtype=np.uint8)
+        self.image_artist = self.ax.imshow(self.blank_image)
         self.ax.set_aspect("equal")
         self.ax.set_xticks([])
         self.ax.set_yticks([])
         self.status = self.fig.text(0.03, 0.955, "", ha="left", va="center", fontsize=10)
-        self.help_text = self.fig.text(
-            0.03,
-            0.925,
-            "Left-drag: draw rough stroke | Red: current snapped result | Green: accepted annotations",
-            ha="left",
-            va="center",
-            fontsize=9,
-        )
+        self.help_text = self.fig.text(0.03, 0.925, "", ha="left", va="center", fontsize=9)
 
         self.widgets: list[Any] = []
-
-        camera_ax = self.fig.add_axes([0.04, 0.035, 0.16, 0.12])
-        camera_ax.set_title("Camera", fontsize=9)
-        camera_active = 0 if self.camera_type == "pinhole" else 1
-        self.camera_radio = RadioButtons(camera_ax, CAMERA_TYPE_CHOICES, active=camera_active)
-        self.camera_radio.on_clicked(self._on_camera_changed)
-        self.widgets.append(self.camera_radio)
-
-        mode_ax = self.fig.add_axes([0.24, 0.035, 0.14, 0.12])
-        mode_ax.set_title("Type", fontsize=9)
-        self.mode_radio = RadioButtons(mode_ax, SNAP_MODE_CHOICES, active=0)
-        self.mode_radio.on_clicked(self._on_snap_mode_changed)
-        self.widgets.append(self.mode_radio)
-
-        button_specs = [
-            ("Redraw", 0.46, self._button_redraw),
-            ("Next", 0.56, self._button_next),
-            ("Save", 0.66, self._button_save),
-            ("Save + Close", 0.76, self._button_save_close),
-        ]
-        for label, x0, callback in button_specs:
-            width = 0.09 if label != "Save + Close" else 0.14
-            button_ax = self.fig.add_axes([x0, 0.075, width, 0.055])
-            button = Button(button_ax, label)
-            button.on_clicked(callback)
-            self.widgets.append(button)
+        self._buttons: dict[str, Any] = {}
+        self.mode_radio: Any | None = None
 
         self.fig.canvas.mpl_connect("button_press_event", self._on_click)
         self.fig.canvas.mpl_connect("motion_notify_event", self._on_motion)
@@ -278,22 +383,221 @@ class LineAidAnnotationGUI:
         self.fig.canvas.mpl_connect("key_press_event", self._on_key)
         _center_figure_window(self.fig)
 
-    def _on_camera_changed(self, label: str) -> None:
-        """Set the global camera type and resnap the pending stroke if present."""
-        self.camera_type = _normalize_camera_type(label)
+    def _clear_controls(self) -> None:
+        """Remove all current-state controls from the figure."""
+        seen_axes: set[int] = set()
+        for widget in list(self.widgets):
+            ax = getattr(widget, "ax", None)
+            if ax is None:
+                continue
+            ax_id = id(ax)
+            if ax_id in seen_axes:
+                continue
+            seen_axes.add(ax_id)
+            try:
+                ax.remove()
+            except ValueError:
+                pass
+        self.widgets.clear()
+        self._buttons.clear()
+        self.mode_radio = None
+
+    def _set_controls(self, button_specs: list[tuple[str, str, float, float, float, Any]]) -> None:
+        """Create only the buttons that are valid for the current GUI state."""
+        from matplotlib.widgets import Button
+
+        self._clear_controls()
+        for key, label, x0, y0, width, callback in button_specs:
+            button_ax = self.fig.add_axes([x0, y0, width, 0.055])
+            button = Button(button_ax, label)
+            button.on_clicked(callback)
+            self.widgets.append(button)
+            self._buttons[key] = button
+
+    def _set_annotation_controls(self) -> None:
+        """Create annotation review controls for the active camera mode."""
+        from matplotlib.widgets import Button, RadioButtons
+
+        self._clear_controls()
+        mode_ax = self.fig.add_axes([0.04, 0.035, 0.14, 0.12])
+        mode_ax.set_title("Type", fontsize=9)
+        active_mode = SNAP_MODE_CHOICES.index(self.snap_mode)
+        self.mode_radio = RadioButtons(mode_ax, SNAP_MODE_CHOICES, active=active_mode)
+        self.mode_radio.on_clicked(self._on_snap_mode_changed)
+        self.widgets.append(self.mode_radio)
+
+        button_specs = [
+            ("redraw", "Redraw", 0.24, 0.08, 0.09, self._button_redraw),
+            ("next", "Next", 0.35, 0.08, 0.09, self._button_next),
+            ("save", "Save", 0.46, 0.08, 0.09, self._button_save),
+            ("save_close", "Save + Close", 0.57, 0.08, 0.14, self._button_save_close),
+            ("reset", "Reset", 0.73, 0.08, 0.10, self._button_reset),
+        ]
+        for key, label, x0, y0, width, callback in button_specs:
+            button_ax = self.fig.add_axes([x0, y0, width, 0.055])
+            button = Button(button_ax, label)
+            button.on_clicked(callback)
+            self.widgets.append(button)
+            self._buttons[key] = button
+
+    def _set_axes_visible(self, visible: bool) -> None:
+        """Show or hide the main image axes."""
+        self.ax.set_visible(visible)
+
+    def _set_image(self, image: np.ndarray) -> None:
+        """Update the image artist and axes limits for a new image."""
+        arr = np.asarray(image)
+        height, width = arr.shape[:2]
+        self.image_artist.set_data(arr)
+        self.image_artist.set_extent((-0.5, width - 0.5, height - 0.5, -0.5))
+        self.ax.set_xlim(-0.5, width - 0.5)
+        self.ax.set_ylim(height - 0.5, -0.5)
+
+    def _clear_dynamic_artists(self) -> None:
+        """Remove dynamic overlay artists."""
+        for artist in self._dynamic_artists:
+            artist.remove()
+        self._dynamic_artists.clear()
+
+    def _default_crop_box(self) -> tuple[float, float, float, float]:
+        """Return the default panorama crop box: left/right/up/down 90 degrees."""
+        x0 = float(self.preview_width) * 0.25
+        x1 = float(self.preview_width) * 0.75
+        y0 = 0.0
+        y1 = float(self.preview_height)
+        return x0, y0, x1, y1
+
+    def _min_crop_width(self) -> float:
+        """Return the minimum crop width in preview pixels."""
+        return max(8.0, float(self.preview_width) * MIN_CROP_FRACTION)
+
+    def _min_crop_height(self) -> float:
+        """Return the minimum crop height in preview pixels."""
+        return max(8.0, float(self.preview_height) * MIN_CROP_FRACTION)
+
+    def _show_camera_select(self) -> None:
+        """Show the camera-mode selection state."""
+        self.state = STATE_CAMERA_SELECT
+        self.camera_type = None
+        self.pending = None
+        self.annotations.clear()
+        self.current_stroke = []
+        self._drawing_stroke = False
+        self._drag_action = None
+        self.snap_mode = "line"
+        self.panorama_center_lam = 0.0
+        self.panorama_center_phi = 0.0
+        self.panorama_setup_image = None
+        self.panorama_crop_box = self._default_crop_box()
+        self.annotation_image = None
+        self.annotation_setup_image = None
+        self.annotation_center_lam = 0.0
+        self.annotation_center_phi = 0.0
+        self.annotation_crop_box = self.panorama_crop_box
+        self.annotation_crop_origin = (0.0, 0.0)
+        self._clear_dynamic_artists()
+        self._set_controls(
+            [
+                ("pinhole", "Pinhole", 0.35, 0.08, 0.12, self._button_choose_pinhole),
+                ("panorama", "Panorama", 0.53, 0.08, 0.14, self._button_choose_panorama),
+            ]
+        )
+        self._set_image(self.blank_image)
+        self._set_axes_visible(False)
+        self.status.set_text("Choose camera mode.")
+        self.help_text.set_text("Pinhole starts annotation directly. Panorama opens view setup first.")
+        self.fig.canvas.draw_idle()
+
+    def _button_choose_pinhole(self, _event: object) -> None:
+        """Enter pinhole line annotation."""
+        self._enter_annotation("pinhole")
+
+    def _button_choose_panorama(self, _event: object) -> None:
+        """Enter panorama view setup."""
+        self._enter_panorama_setup()
+
+    def _enter_panorama_setup(self) -> None:
+        """Show panorama center and crop setup."""
+        self.state = STATE_PANORAMA_SETUP
+        self.camera_type = "panorama"
+        self.pending = None
+        self.annotations.clear()
+        self.current_stroke = []
+        self._drawing_stroke = False
+        self._drag_action = None
+        self.panorama_center_lam = 0.0
+        self.panorama_center_phi = 0.0
+        self.panorama_crop_box = self._default_crop_box()
+        self._set_controls(
+            [
+                ("h_reset", "H Reset", 0.34, 0.08, 0.11, self._button_h_reset),
+                ("v_reset", "V Reset", 0.47, 0.08, 0.11, self._button_v_reset),
+                ("done", "Done", 0.60, 0.08, 0.10, self._button_done_setup),
+            ]
+        )
+        self._set_axes_visible(True)
+        self._render_panorama_setup_image()
+        self.status_extra = "Adjust panorama view center and crop range."
+        self._refresh()
+
+    def _enter_annotation(self, camera_type: str) -> None:
+        """Enter line annotation for the selected camera type."""
+        self.state = STATE_ANNOTATE
+        self.camera_type = _normalize_camera_type(camera_type)
         if self.camera_type == "pinhole" and self.fov_deg is None:
             self.fov_deg = FALLBACK_FOV_DEG
-        if self.pending is not None:
-            self._resnap_pending()
+        self.current_stroke = []
+        self.pending = None
+        self._drawing_stroke = False
+        self._drag_action = None
+        self._set_annotation_controls()
+        self._set_axes_visible(True)
+        if self.camera_type == "panorama":
+            self._build_panorama_annotation_image()
         else:
-            self.status_extra = f"Camera set to {self.camera_type}."
-            self._refresh()
+            self.annotation_image = self.preview_image
+            self.annotation_setup_image = None
+            self.annotation_center_lam = 0.0
+            self.annotation_center_phi = 0.0
+            self.annotation_crop_box = (0.0, 0.0, float(self.preview_width), float(self.preview_height))
+            self.annotation_crop_origin = (0.0, 0.0)
+        self.status_extra = "Draw a rough stroke. Then choose Redraw or Next."
+        self._refresh()
+
+    def _button_done_setup(self, _event: object) -> None:
+        """Finalize panorama setup and enter line annotation."""
+        if self.state == STATE_PANORAMA_SETUP:
+            self._enter_annotation("panorama")
+
+    def _button_h_reset(self, _event: object) -> None:
+        """Reset the panorama horizontal view center."""
+        if self.state != STATE_PANORAMA_SETUP:
+            return
+        self.panorama_center_lam = 0.0
+        self._render_panorama_setup_image()
+        self.status_extra = "Horizontal view center reset."
+        self._refresh()
+
+    def _button_v_reset(self, _event: object) -> None:
+        """Reset the panorama vertical view center."""
+        if self.state != STATE_PANORAMA_SETUP:
+            return
+        self.panorama_center_phi = 0.0
+        self._render_panorama_setup_image()
+        self.status_extra = "Vertical view center reset."
+        self._refresh()
+
+    def _button_reset(self, _event: object) -> None:
+        """Discard state and return to camera selection."""
+        self._show_camera_select()
 
     def _on_snap_mode_changed(self, label: str) -> None:
         """Set the annotation type and resnap the pending stroke if present."""
         if label not in SNAP_MODE_CHOICES:
             raise ValueError(f"mode must be one of {SNAP_MODE_CHOICES}; got {label!r}.")
         self.snap_mode = label
+        if self.state != STATE_ANNOTATE:
+            return
         if self.pending is not None:
             self._resnap_pending()
         else:
@@ -302,6 +606,8 @@ class LineAidAnnotationGUI:
 
     def _button_redraw(self, _event: object) -> None:
         """Discard the pending result and allow the user to draw it again."""
+        if self.state != STATE_ANNOTATE:
+            return
         self.pending = None
         self.current_stroke = []
         self._drawing_stroke = False
@@ -310,6 +616,8 @@ class LineAidAnnotationGUI:
 
     def _button_next(self, _event: object) -> None:
         """Accept the pending result and prepare for the next annotation."""
+        if self.state != STATE_ANNOTATE:
+            return
         if self._accept_pending():
             self.status_extra = f"Accepted annotation {len(self.annotations)}. Draw the next stroke."
         else:
@@ -329,51 +637,209 @@ class LineAidAnnotationGUI:
             self._refresh()
 
     def _on_key(self, event: object) -> None:
-        """Handle keyboard aliases for the visible actions only."""
+        """Handle keyboard aliases for the visible actions."""
         key = (getattr(event, "key", "") or "").lower()
-        if key in ("r", "escape"):
-            self._button_redraw(event)
-        elif key in ("n", "enter", " "):
-            self._button_next(event)
-        elif key in ("s", "ctrl+s", "cmd+s"):
-            self._button_save(event)
+        if self.state == STATE_ANNOTATE:
+            if key in ("r", "escape"):
+                self._button_redraw(event)
+            elif key in ("n", "enter", " "):
+                self._button_next(event)
+            elif key in ("s", "ctrl+s", "cmd+s"):
+                self._button_save(event)
+        elif self.state == STATE_PANORAMA_SETUP:
+            if key in ("enter", " "):
+                self._button_done_setup(event)
 
-    def _clip_xy(self, x: float, y: float) -> tuple[float, float]:
-        """Clip floating preview coordinates into the preview image extent."""
-        return float(np.clip(x, 0.0, self.width - 1.0)), float(np.clip(y, 0.0, self.height - 1.0))
+    def _clip_setup_xy(self, x: float, y: float) -> tuple[float, float]:
+        """Clip floating setup coordinates into the preview extent."""
+        return float(np.clip(x, 0.0, self.preview_width - 1.0)), float(np.clip(y, 0.0, self.preview_height - 1.0))
 
-    def _preview_to_original_xy(self, x: float, y: float) -> tuple[float, float]:
-        """Map preview coordinates back to original image coordinates."""
-        if self.width == self.original_width and self.height == self.original_height:
-            x_original = x
-            y_original = y
-        else:
-            x_original = (x + 0.5) * (self.original_width / self.width) - 0.5
-            y_original = (y + 0.5) * (self.original_height / self.height) - 0.5
-        return (
-            float(np.clip(x_original, 0.0, self.original_width - 1.0)),
-            float(np.clip(y_original, 0.0, self.original_height - 1.0)),
+    def _clip_annotation_xy(self, x: float, y: float) -> tuple[float, float]:
+        """Clip floating annotation coordinates into the annotation image extent."""
+        image = self._require_annotation_image()
+        height, width = image.shape[:2]
+        return float(np.clip(x, 0.0, width - 1.0)), float(np.clip(y, 0.0, height - 1.0))
+
+    def _require_annotation_image(self) -> np.ndarray:
+        """Return the active annotation image."""
+        if self.annotation_image is None:
+            raise RuntimeError("Annotation image is not initialized.")
+        return self.annotation_image
+
+    def _render_panorama_setup_image(self) -> None:
+        """Render the full preview panorama for the current center."""
+        self.panorama_setup_image = _remap_panorama_preview(
+            self.preview_image,
+            self.panorama_center_lam,
+            self.panorama_center_phi,
+            self.preview_width,
+            self.preview_height,
         )
 
-    def _preview_points_to_original(self, points: list[tuple[float, float]]) -> np.ndarray:
-        """Map preview-space points to original-image coordinates."""
-        return np.asarray([self._preview_to_original_xy(x, y) for x, y in points], dtype=np.float32)
+    def _build_panorama_annotation_image(self) -> None:
+        """Crop the selected panorama setup view for annotation."""
+        if self.panorama_setup_image is None:
+            self._render_panorama_setup_image()
+        if self.panorama_setup_image is None:
+            raise RuntimeError("Panorama setup image is not initialized.")
+        crop_box = self._normalized_crop_box()
+        self.annotation_center_lam = self.panorama_center_lam
+        self.annotation_center_phi = self.panorama_center_phi
+        self.annotation_crop_box = crop_box
+        self.annotation_setup_image = self.panorama_setup_image.copy()
+        ix0, iy0, ix1, iy1 = self._crop_indices_from_box(crop_box)
+        self.annotation_crop_origin = (float(ix0), float(iy0))
+        self.annotation_image = self.annotation_setup_image[iy0:iy1, ix0:ix1].copy()
 
-    def _original_points_to_preview(self, points: np.ndarray) -> np.ndarray:
-        """Map original-image coordinates to preview-space coordinates."""
-        arr = np.asarray(points, dtype=np.float32)
-        if self.width == self.original_width and self.height == self.original_height:
-            return arr
-        scale_x = self.width / self.original_width
-        scale_y = self.height / self.original_height
-        preview = arr.copy()
-        preview[:, 0] = (preview[:, 0] + 0.5) * scale_x - 0.5
-        preview[:, 1] = (preview[:, 1] + 0.5) * scale_y - 0.5
-        return preview
+    def _crop_indices_from_box(self, crop_box: tuple[float, float, float, float]) -> tuple[int, int, int, int]:
+        """Convert a setup crop box to array slice indices using pixel-center inclusion."""
+        x0, y0, x1, y1 = crop_box
+        ix0 = int(np.ceil(x0))
+        iy0 = int(np.ceil(y0))
+        ix1 = int(np.ceil(x1))
+        iy1 = int(np.ceil(y1))
+        ix0 = max(0, min(ix0, self.preview_width - 2))
+        iy0 = max(0, min(iy0, self.preview_height - 2))
+        ix1 = max(ix0 + 2, min(ix1, self.preview_width))
+        iy1 = max(iy0 + 2, min(iy1, self.preview_height))
+        return ix0, iy0, ix1, iy1
+
+    def _normalized_crop_box(self) -> tuple[float, float, float, float]:
+        """Return the crop box ordered and clipped to the setup image extent."""
+        x0, y0, x1, y1 = self.panorama_crop_box
+        width = float(self.preview_width)
+        height = float(self.preview_height)
+        left = float(np.clip(min(x0, x1), 0.0, width))
+        right = float(np.clip(max(x0, x1), 0.0, width))
+        top = float(np.clip(min(y0, y1), 0.0, height))
+        bottom = float(np.clip(max(y0, y1), 0.0, height))
+        min_width = min(self._min_crop_width(), width)
+        min_height = min(self._min_crop_height(), height)
+        if right - left < min_width:
+            center = (left + right) * 0.5
+            half = min_width * 0.5
+            center = float(np.clip(center, half, width - half))
+            left = center - half
+            right = center + half
+        if bottom - top < min_height:
+            center = (top + bottom) * 0.5
+            half = min_height * 0.5
+            center = float(np.clip(center, half, height - half))
+            top = center - half
+            bottom = center + half
+        return left, top, right, bottom
+
+    def _hit_crop_edge(self, x: float, y: float) -> str | None:
+        """Return the crop edge under the cursor, if any."""
+        left, top, right, bottom = self._normalized_crop_box()
+        near_left = abs(x - left) <= CROP_EDGE_HIT_PX and top - CROP_EDGE_HIT_PX <= y <= bottom + CROP_EDGE_HIT_PX
+        near_right = abs(x - right) <= CROP_EDGE_HIT_PX and top - CROP_EDGE_HIT_PX <= y <= bottom + CROP_EDGE_HIT_PX
+        near_top = abs(y - top) <= CROP_EDGE_HIT_PX and left - CROP_EDGE_HIT_PX <= x <= right + CROP_EDGE_HIT_PX
+        near_bottom = abs(y - bottom) <= CROP_EDGE_HIT_PX and left - CROP_EDGE_HIT_PX <= x <= right + CROP_EDGE_HIT_PX
+        distances = [
+            ("left", abs(x - left), near_left),
+            ("right", abs(x - right), near_right),
+            ("top", abs(y - top), near_top),
+            ("bottom", abs(y - bottom), near_bottom),
+        ]
+        hits = [(name, dist) for name, dist, active in distances if active]
+        if not hits:
+            return None
+        return min(hits, key=lambda item: item[1])[0]
+
+    def _update_crop_edge(self, edge: str, x: float, y: float) -> None:
+        """Resize the setup crop box by dragging one edge."""
+        left, top, right, bottom = self._drag_start_crop or self._normalized_crop_box()
+        if edge == "left":
+            left = min(float(np.clip(x, 0.0, float(self.preview_width))), right - self._min_crop_width())
+        elif edge == "right":
+            right = max(float(np.clip(x, 0.0, float(self.preview_width))), left + self._min_crop_width())
+        elif edge == "top":
+            top = min(float(np.clip(y, 0.0, float(self.preview_height))), bottom - self._min_crop_height())
+        elif edge == "bottom":
+            bottom = max(float(np.clip(y, 0.0, float(self.preview_height))), top + self._min_crop_height())
+        self.panorama_crop_box = (
+            float(np.clip(left, 0.0, float(self.preview_width))),
+            float(np.clip(top, 0.0, float(self.preview_height))),
+            float(np.clip(right, 0.0, float(self.preview_width))),
+            float(np.clip(bottom, 0.0, float(self.preview_height))),
+        )
+
+    def _update_panorama_center(self, x: float, y: float) -> None:
+        """Pan the panorama setup center based on image-content dragging."""
+        if self._drag_start_xy is None or self._drag_start_center is None:
+            return
+        start_x, start_y = self._drag_start_xy
+        start_lam, start_phi = self._drag_start_center
+        dx = x - start_x
+        dy = y - start_y
+        self.panorama_center_lam = _wrap_angle(start_lam - (dx / max(float(self.preview_width - 1), 1.0)) * 2.0 * math.pi)
+        self.panorama_center_phi = float(
+            np.clip(
+                start_phi - (dy / max(float(self.preview_height - 1), 1.0)) * math.pi,
+                -PANORAMA_MAX_ABS_PITCH,
+                PANORAMA_MAX_ABS_PITCH,
+            )
+        )
+        self._render_panorama_setup_image()
+
+    def _annotation_points_to_original(self, points: np.ndarray) -> np.ndarray:
+        """Map annotation-image coordinates to original-image coordinates."""
+        arr = np.asarray(points, dtype=np.float64)
+        if arr.ndim != 2 or arr.shape[1] != 2:
+            raise ValueError(f"points must have shape (N, 2); got {arr.shape}.")
+        if self.camera_type == "panorama":
+            crop_x, crop_y = self.annotation_crop_origin
+            setup_x = arr[:, 0] + crop_x
+            setup_y = arr[:, 1] + crop_y
+            local_lam, local_phi = _equirect_pixel_to_angles(
+                setup_x,
+                setup_y,
+                self.preview_width,
+                self.preview_height,
+            )
+            world_lam, world_phi = _local_to_world_angles(
+                local_lam,
+                local_phi,
+                self.annotation_center_lam,
+                self.annotation_center_phi,
+            )
+            x, y = _angles_to_equirect_pixel(world_lam, world_phi, self.original_width, self.original_height)
+        else:
+            x = (arr[:, 0] + 0.5) * (self.original_width / self.preview_width) - 0.5
+            y = (arr[:, 1] + 0.5) * (self.original_height / self.preview_height) - 0.5
+        out = np.column_stack((x, y)).astype(np.float32)
+        out[:, 0] = np.mod(out[:, 0], float(self.original_width)) if self.camera_type == "panorama" else np.clip(
+            out[:, 0],
+            0.0,
+            float(self.original_width - 1),
+        )
+        out[:, 1] = np.clip(out[:, 1], 0.0, float(self.original_height - 1))
+        return out
+
+    def _original_points_to_annotation(self, points: np.ndarray) -> np.ndarray:
+        """Map original-image coordinates to active annotation-image coordinates."""
+        arr = np.asarray(points, dtype=np.float64)
+        if self.camera_type == "panorama":
+            lam, phi = _equirect_pixel_to_angles(arr[:, 0], arr[:, 1], self.original_width, self.original_height)
+            local_lam, local_phi = _world_to_local_angles(
+                lam,
+                phi,
+                self.annotation_center_lam,
+                self.annotation_center_phi,
+            )
+            setup_x, setup_y = _angles_to_equirect_pixel(local_lam, local_phi, self.preview_width, self.preview_height)
+            crop_x, crop_y = self.annotation_crop_origin
+            x = setup_x - crop_x
+            y = setup_y - crop_y
+        else:
+            x = (arr[:, 0] + 0.5) * (self.preview_width / self.original_width) - 0.5
+            y = (arr[:, 1] + 0.5) * (self.preview_height / self.original_height) - 0.5
+        return np.column_stack((x, y)).astype(np.float32)
 
     def _on_click(self, event: object) -> None:
-        """Start a rough stroke when no pending result is waiting for review."""
-        if self.pending is not None:
+        """Handle mouse press by state."""
+        if self.state == STATE_ANNOTATE and self.pending is not None:
             self.status_extra = "Choose Redraw or Next before drawing another stroke."
             self._refresh()
             return
@@ -383,32 +849,62 @@ class LineAidAnnotationGUI:
             return
         if getattr(event, "button", None) != 1:
             return
-        x, y = self._clip_xy(float(event.xdata), float(event.ydata))
-        self.current_stroke = [(x, y)]
-        self._drawing_stroke = True
-        self.status_extra = "Drawing rough stroke."
-        self._refresh()
+
+        if self.state == STATE_PANORAMA_SETUP:
+            x, y = self._clip_setup_xy(float(event.xdata), float(event.ydata))
+            edge = self._hit_crop_edge(x, y)
+            self._drag_action = f"edge:{edge}" if edge is not None else "pan"
+            self._drag_start_xy = (x, y)
+            self._drag_start_center = (self.panorama_center_lam, self.panorama_center_phi)
+            self._drag_start_crop = self._normalized_crop_box()
+            return
+
+        if self.state == STATE_ANNOTATE:
+            x, y = self._clip_annotation_xy(float(event.xdata), float(event.ydata))
+            self.current_stroke = [(x, y)]
+            self._drawing_stroke = True
+            self.status_extra = "Drawing rough stroke."
+            self._refresh()
 
     def _on_motion(self, event: object) -> None:
-        """Track the rough stroke while dragging."""
-        if not self._drawing_stroke or self.pending is not None:
+        """Handle mouse drag by state."""
+        if self.state == STATE_ANNOTATE and self.pending is not None:
             return
         if getattr(event, "inaxes", None) is not self.ax:
             return
         if getattr(event, "xdata", None) is None or getattr(event, "ydata", None) is None:
             return
-        x, y = self._clip_xy(float(event.xdata), float(event.ydata))
-        if not self.current_stroke:
-            self.current_stroke = [(x, y)]
-        else:
-            last_x, last_y = self.current_stroke[-1]
-            if math.hypot(x - last_x, y - last_y) >= STROKE_MIN_SPACING_PX:
-                self.current_stroke.append((x, y))
-        self._refresh()
+
+        if self.state == STATE_PANORAMA_SETUP and self._drag_action is not None:
+            x, y = self._clip_setup_xy(float(event.xdata), float(event.ydata))
+            if self._drag_action == "pan":
+                self._update_panorama_center(x, y)
+            elif self._drag_action.startswith("edge:"):
+                self._update_crop_edge(self._drag_action.split(":", 1)[1], x, y)
+            self._refresh()
+            return
+
+        if self.state == STATE_ANNOTATE and self._drawing_stroke:
+            x, y = self._clip_annotation_xy(float(event.xdata), float(event.ydata))
+            if not self.current_stroke:
+                self.current_stroke = [(x, y)]
+            else:
+                last_x, last_y = self.current_stroke[-1]
+                if math.hypot(x - last_x, y - last_y) >= STROKE_MIN_SPACING_PX:
+                    self.current_stroke.append((x, y))
+            self._refresh()
 
     def _on_release(self, event: object) -> None:
-        """Finish the rough stroke and create a pending snapped result."""
-        if not self._drawing_stroke or self.pending is not None:
+        """Handle mouse release by state."""
+        if self.state == STATE_PANORAMA_SETUP and self._drag_action is not None:
+            self._drag_action = None
+            self._drag_start_xy = None
+            self._drag_start_center = None
+            self._drag_start_crop = None
+            self._refresh()
+            return
+
+        if self.state != STATE_ANNOTATE or not self._drawing_stroke or self.pending is not None:
             return
         self._drawing_stroke = False
         if (
@@ -416,7 +912,7 @@ class LineAidAnnotationGUI:
             and getattr(event, "xdata", None) is not None
             and getattr(event, "ydata", None) is not None
         ):
-            x, y = self._clip_xy(float(event.xdata), float(event.ydata))
+            x, y = self._clip_annotation_xy(float(event.xdata), float(event.ydata))
             if self.current_stroke:
                 last_x, last_y = self.current_stroke[-1]
                 if math.hypot(x - last_x, y - last_y) > 0.0:
@@ -426,27 +922,48 @@ class LineAidAnnotationGUI:
             self.current_stroke = []
             self._refresh()
             return
-
-        stroke_original = self._preview_points_to_original(self.current_stroke)
+        stroke = np.asarray(self.current_stroke, dtype=np.float32)
         self.current_stroke = []
-        self._set_pending_from_original_stroke(stroke_original)
+        self._set_pending_from_annotation_stroke(stroke)
 
-    def _set_pending_from_original_stroke(self, stroke_original: np.ndarray) -> None:
-        """Run the 2D snapper and store the result as pending."""
+    def _set_pending_from_annotation_stroke(self, stroke: np.ndarray) -> None:
+        """Run the 2D snapper on the annotation image and store a pending result."""
+        image = self._require_annotation_image()
         try:
-            result = snap_annotation(
-                self.original_image,
-                stroke_original,
-                camera_type=self.camera_type,
+            snapped = snap_annotation(
+                image,
+                stroke,
+                camera_type="pinhole",
                 mode=self.snap_mode,
                 config=self.snap_config,
             )
+            result_points = self._annotation_points_to_original(snapped.points)
+            source_points = self._annotation_points_to_original(snapped.source_stroke)
+            debug = dict(snapped.debug)
+            debug.update(
+                {
+                    "annotation_camera_type": self.camera_type,
+                    "annotation_points": snapped.points,
+                    "annotation_source_stroke": snapped.source_stroke,
+                    "panorama_center_lam": self.annotation_center_lam,
+                    "panorama_center_phi": self.annotation_center_phi,
+                    "panorama_crop_box": self.annotation_crop_box,
+                }
+            )
+            result = SnapResult(
+                points=result_points.astype(np.float32),
+                source_stroke=source_points.astype(np.float32),
+                mode=self.snap_mode,
+                camera_type=str(self.camera_type),
+                confidence=snapped.confidence,
+                debug=debug,
+            )
             self.pending = AnnotationItem(
                 result=result,
-                preview_points=self._original_points_to_preview(result.points),
-                source_preview_points=self._original_points_to_preview(stroke_original),
-                source_original_points=stroke_original.astype(np.float32, copy=True),
-                camera_type=self.camera_type,
+                preview_points=snapped.points.astype(np.float32, copy=True),
+                source_preview_points=snapped.source_stroke.astype(np.float32, copy=True),
+                source_original_points=source_points.astype(np.float32, copy=True),
+                camera_type=str(self.camera_type),
                 snap_mode=self.snap_mode,
             )
             self.status_extra = (
@@ -459,12 +976,12 @@ class LineAidAnnotationGUI:
         self._refresh()
 
     def _resnap_pending(self) -> None:
-        """Recompute the pending result after camera or type changes."""
+        """Recompute the pending result after the annotation type changes."""
         if self.pending is None:
             return
-        stroke_original = self.pending.source_original_points.copy()
+        stroke = self.pending.source_preview_points.copy()
         self.pending = None
-        self._set_pending_from_original_stroke(stroke_original)
+        self._set_pending_from_annotation_stroke(stroke)
 
     def _accept_pending(self) -> bool:
         """Move the pending result into the accepted annotation list."""
@@ -482,6 +999,9 @@ class LineAidAnnotationGUI:
 
     def _save(self) -> bool:
         """Save accepted annotations, accepting the pending result first if needed."""
+        if self.state != STATE_ANNOTATE:
+            self.status_extra = "Enter annotation mode before saving."
+            return False
         if self.pending is not None:
             self._accept_pending()
 
@@ -497,7 +1017,7 @@ class LineAidAnnotationGUI:
                 self.image_path,
                 str(self.json_path),
                 image_shape=(self.original_height, self.original_width),
-                camera_type=self.camera_type,
+                camera_type=str(self.camera_type),
                 fov_deg=self.fov_deg,
             )
         except Exception as exc:
@@ -507,11 +1027,31 @@ class LineAidAnnotationGUI:
         return True
 
     def _refresh(self) -> None:
-        """Redraw accepted annotations, pending result, current stroke, and status."""
-        for artist in self._dynamic_artists:
-            artist.remove()
-        self._dynamic_artists.clear()
+        """Redraw the current GUI state."""
+        self._clear_dynamic_artists()
+        if self.state == STATE_CAMERA_SELECT:
+            self.fig.canvas.draw_idle()
+            return
 
+        if self.state == STATE_PANORAMA_SETUP:
+            if self.panorama_setup_image is None:
+                self._render_panorama_setup_image()
+            if self.panorama_setup_image is None:
+                raise RuntimeError("Panorama setup image is not initialized.")
+            self._set_image(self.panorama_setup_image)
+            self._draw_crop_overlay()
+            center_deg = (math.degrees(self.panorama_center_lam), math.degrees(self.panorama_center_phi))
+            self.status.set_text(
+                f"Camera: panorama | Center: ({center_deg[0]:.1f}, {center_deg[1]:.1f}) | {self.status_extra}"
+            )
+            self.help_text.set_text(
+                "Drag image content to move view center. Drag crop edges to resize. H/V Reset recalibrates center."
+            )
+            self.fig.canvas.draw_idle()
+            return
+
+        image = self._require_annotation_image()
+        self._set_image(image)
         for idx, item in enumerate(self.annotations, start=1):
             points = item.preview_points
             line_artist = self.ax.plot(points[:, 0], points[:, 1], color="#00cc66", linewidth=2.2, zorder=4)[0]
@@ -561,15 +1101,51 @@ class LineAidAnnotationGUI:
             self._dynamic_artists.append(stroke_artist)
 
         fov_text = f", fov={self.fov_deg:.2f}" if self.camera_type == "pinhole" and self.fov_deg is not None else ""
-        size_text = f"preview {self.width}x{self.height}"
+        size_text = f"preview {self.preview_width}x{self.preview_height}"
         if self.is_downsampled:
             size_text += f", original {self.original_width}x{self.original_height}"
+        image_h, image_w = image.shape[:2]
         pending_text = "yes" if self.pending is not None else "no"
         self.status.set_text(
             f"Camera: {self.camera_type}{fov_text} | Type: {self.snap_mode} | "
-            f"Accepted: {len(self.annotations)} | Pending: {pending_text} | {size_text} | {self.status_extra}"
+            f"Accepted: {len(self.annotations)} | Pending: {pending_text} | "
+            f"annotation {image_w}x{image_h} | {size_text} | {self.status_extra}"
+        )
+        self.help_text.set_text(
+            "Left-drag: draw rough stroke | Red: pending snapped result | Green: accepted annotations"
         )
         self.fig.canvas.draw_idle()
+
+    def _draw_crop_overlay(self) -> None:
+        """Draw dimmed outside-crop overlay and crop edge lines."""
+        from matplotlib.patches import Rectangle
+
+        left, top, right, bottom = self._normalized_crop_box()
+        width = float(self.preview_width)
+        height = float(self.preview_height)
+        overlays = [
+            (0.0, 0.0, width, top),
+            (0.0, bottom, width, height - bottom),
+            (0.0, top, left, bottom - top),
+            (right, top, width - right, bottom - top),
+        ]
+        for x, y, w, h in overlays:
+            if w <= 0.0 or h <= 0.0:
+                continue
+            rect = Rectangle((x, y), w, h, facecolor="black", alpha=0.45, edgecolor="none", zorder=4)
+            self.ax.add_patch(rect)
+            self._dynamic_artists.append(rect)
+        crop_rect = Rectangle(
+            (left, top),
+            right - left,
+            bottom - top,
+            fill=False,
+            edgecolor="#ffcc00",
+            linewidth=1.2,
+            zorder=5,
+        )
+        self.ax.add_patch(crop_rect)
+        self._dynamic_artists.append(crop_rect)
 
 
 def parse_args() -> argparse.Namespace:
@@ -590,7 +1166,7 @@ def parse_args() -> argparse.Namespace:
         "--camera-type",
         choices=("pinhole", "panorama", "360"),
         default="pinhole",
-        help="Camera type for snapping and export.",
+        help="Initial camera type hint. The GUI still starts at camera selection.",
     )
     parser.add_argument(
         "--output-dir",
@@ -613,14 +1189,11 @@ def main() -> None:
         raise FileNotFoundError(f"Input image does not exist: {image_path}")
 
     camera_type = _normalize_camera_type(args.camera_type)
-    if camera_type == "pinhole" and args.fov is None:
+    if args.fov is None:
         fov, source = estimate_fov_from_exif(str(image_path))
-        print(f"Using horizontal FOV {fov:.2f} degrees ({source}).")
+        print(f"Using horizontal FOV {fov:.2f} degrees ({source}) if pinhole mode is selected.")
     else:
         fov = args.fov
-        if camera_type == "panorama":
-            print("Using panorama camera type.")
-
     output_dir = args.output_dir or str(image_path.parent)
     snap_config = load_snap_config(args.config_json)
     LineAidAnnotationGUI(str(image_path), fov, output_dir, camera_type=camera_type, snap_config=snap_config).run()
