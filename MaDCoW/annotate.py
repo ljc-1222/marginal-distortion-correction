@@ -18,6 +18,16 @@ from typing import Any
 import numpy as np
 from PIL import ExifTags, Image
 
+from annotation_gui import AnnotationSession, load_image_view
+from annotation_gui.base import (
+    EmbeddedViewSetupController,
+    add_button_row,
+    clear_widget_axes,
+    create_image_figure,
+    set_image_artist,
+)
+from annotation_gui.io import build_annotation_payload, write_annotation_json
+
 import piexif
 from .src import CameraConfig
 from .src.camera import Camera
@@ -28,12 +38,12 @@ FALLBACK_FOV_DEG = 90.0
 PREVIEW_MAX_SIDE = 1200
 LINE_RESAMPLE_POINTS = 128
 LINE_MIN_SPACING_PX = 3.0
-CAMERA_MODEL_CHOICES = ("pinhole", "360")
+CAMERA_MODEL_CHOICES = ("pinhole", "360", "panorama_view")
 CAMERA_MODEL_LABELS = {
     "pinhole": "Pinhole",
     "360": "360",
+    "panorama_view": "Panorama View",
 }
-CAMERA_MODEL_FROM_LABEL = {label: model for model, label in CAMERA_MODEL_LABELS.items()}
 if "MPLCONFIGDIR" not in os.environ:
     mpl_config_dir = Path("/tmp") / "madcow_matplotlib"
     mpl_config_dir.mkdir(parents=True, exist_ok=True)
@@ -252,18 +262,17 @@ class AnnotationGUI:
     """Interactive annotation tool for a single input image.
 
     Controls:
-        * ``l`` / ``r``: switch line / region mode.
-        * Left drag in line mode: trace a straight-structure curve.
-        * Left drag in region mode: paint current ROI mask.
-        * Right drag in region mode: erase current ROI mask.
+        * ROI phase left drag: paint current ROI mask.
+        * ROI phase ``Redraw``: clear the current ROI draft.
+        * ROI phase ``Next ROI``: accept the current ROI and start the next draft.
+        * ROI phase ``Done ROI``: lock ROI masks and switch to lines.
+        * Lines phase left drag: trace a straight-structure curve.
+        * Lines phase ``Redraw``: clear the pending line draft.
+        * Lines phase ``Next``: accept the pending line.
         * ``+`` / ``-``: change brush radius.
-        * ``n``: create a new ROI.
-        * ``[`` / ``]``: previous / next ROI.
-        * ``u``: undo last line or mask stroke.
-        * ``c``: clear current ROI.
         * ``s``: save annotations.
-        * Camera radio buttons: choose pinhole or 360 annotation geometry.
-        * ``escape``: cancel the current line or stroke.
+        * ``d``: finish ROI setup and switch to line drawing.
+        * ``r`` / ``escape``: redraw the current draft.
     """
 
     def __init__(
@@ -272,6 +281,9 @@ class AnnotationGUI:
         fov_deg: float | None,
         output_dir: str,
         camera_model: str = "pinhole",
+        source_image_path: str | None = None,
+        view_metadata: dict[str, Any] | None = None,
+        start_with_setup: bool = False,
     ) -> None:
         """Initialize the GUI state.
 
@@ -291,49 +303,47 @@ class AnnotationGUI:
             raise ValueError(f"fov_deg must lie in (0, 180); got {self.fov_deg}.")
         self.output_dir = Path(output_dir).resolve()
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.source_image_path = source_image_path
+        self.view_metadata = view_metadata
 
         self.preview_max_side = PREVIEW_MAX_SIDE
-        with Image.open(self.image_path) as img:
-            original_image = img.convert("RGB")
-            self.original_width, self.original_height = original_image.size
-            preview_size = _compute_preview_size(
-                self.original_width,
-                self.original_height,
-                self.preview_max_side,
-            )
-            if preview_size == original_image.size:
-                preview_image = original_image
-            else:
-                preview_image = original_image.resize(preview_size, _lanczos_resampling())
-            self.image = np.array(preview_image)
-
+        self.session = AnnotationSession.from_image(self.image_path, self.preview_max_side, self.fov_deg)
+        self.image_view = load_image_view(self.image_path, self.preview_max_side)
+        self.original_width = self.image_view.width
+        self.original_height = self.image_view.height
+        self.image = self.image_view.preview
         self.height, self.width = self.image.shape[:2]
         self.preview_width = self.width
         self.preview_height = self.height
-        self.is_downsampled = (
-            self.preview_width != self.original_width
-            or self.preview_height != self.original_height
-        )
-        self._set_camera_model(self.camera_model)
+        self.is_downsampled = self.image_view.is_downsampled
+        self.camera: Camera | None = None
+        if not start_with_setup:
+            self._set_camera_model(self.camera_model)
 
-        self.mode = "line"
+        self.phase = "setup" if start_with_setup else "roi"
+        self.mode = "region"
+        self.status_extra = "Choose camera mode." if start_with_setup else "Draw the current ROI draft."
         self.brush_radius = max(4, int(round(min(self.height, self.width) * 0.02)))
         self.lines: list[list[tuple[float, float]]] = []
+        self.pending_line: list[tuple[float, float]] | None = None
         self.current_line_points: list[tuple[float, float]] = []
         self._drawing_line = False
         self.regions: list[dict[str, Any]] = []
         self.current_region = 0
-        self.history: list[tuple[str, Any]] = []
+        self.next_region_idx = 1
         self._drawing = False
         self._stroke_value = True
-        self._stroke_snapshot: np.ndarray | None = None
-        self._syncing_name = False
         self._dynamic_artists: list[Any] = []
+        self.setup_controller: EmbeddedViewSetupController | None = None
 
-        self._add_region("region_1")
         self.json_path = self.output_dir / f"{Path(self.image_path).stem}.json"
         self._build_figure()
-        self._refresh()
+        if start_with_setup:
+            self._start_view_setup()
+        else:
+            self._add_region()
+            self._set_roi_controls()
+            self._refresh()
 
     def _set_camera_model(self, camera_model: str) -> None:
         """Set the input camera model used for saving line directions."""
@@ -346,6 +356,7 @@ class AnnotationGUI:
                 width=self.original_width,
                 height=self.original_height,
                 model=model,
+                view=self.view_metadata,
             )
         )
         self.camera_model = self.camera.model
@@ -358,83 +369,128 @@ class AnnotationGUI:
 
     def _build_figure(self) -> None:
         """Create the Matplotlib figure, artists, widgets, and callbacks."""
-        import matplotlib.pyplot as plt
-        from matplotlib.widgets import Button, RadioButtons, TextBox
-
-        self.fig, self.ax = plt.subplots(figsize=(12, 8))
-        self.fig.canvas.manager.set_window_title("MaDCoW Annotation Tool")
-        self.fig.subplots_adjust(left=0.03, right=0.99, bottom=0.25, top=0.94)
-        self.ax.imshow(self.image)
-        self.ax.set_xlim(-0.5, self.width - 0.5)
-        self.ax.set_ylim(self.height - 0.5, -0.5)
-        self.ax.set_aspect("equal")
-        self.ax.set_xticks([])
-        self.ax.set_yticks([])
+        self.fig, self.ax, self.image_artist, self.status, self.help_text = create_image_figure(
+            "MaDCoW Annotation Tool",
+            self.image,
+        )
         self.mask_artist = self.ax.imshow(np.zeros((self.height, self.width, 4)), interpolation="nearest")
-        self.status = self.fig.text(0.03, 0.965, "", ha="left", va="center", fontsize=10)
 
         self.widgets: list[Any] = []
-
-        def add_centered_button_row(buttons: list[tuple[str, float, Any]], y0: float) -> None:
-            gap = 0.018
-            total_width = sum(width for _label, width, _callback in buttons) + gap * (len(buttons) - 1)
-            x0 = (1.0 - total_width) * 0.5
-            for label, width, callback in buttons:
-                ax_button = self.fig.add_axes([x0, y0, width, 0.045])
-                button = Button(ax_button, label)
-                button.on_clicked(callback)
-                self.widgets.append(button)
-                x0 += width + gap
-
-        add_centered_button_row(
-            [
-                ("Line", 0.075, self._button_line),
-                ("Region", 0.085, self._button_region),
-                ("New ROI", 0.095, self._button_new_region),
-                ("Prev", 0.075, self._button_prev_region),
-                ("Next", 0.075, self._button_next_region),
-                ("Brush -", 0.085, self._button_brush_down),
-                ("Brush +", 0.085, self._button_brush_up),
-            ],
-            0.045,
-        )
-        add_centered_button_row(
-            [
-                ("Undo", 0.075, self._button_undo),
-                ("Clear", 0.075, self._button_clear_region),
-                ("Save", 0.075, self._button_save),
-                ("Save+Close", 0.120, self._button_save_close),
-            ],
-            0.105,
-        )
-
-        controls_width = 0.28 + 0.04 + 0.17
-        controls_x0 = (1.0 - controls_width) * 0.5
-        name_ax = self.fig.add_axes([controls_x0, 0.165, 0.28, 0.045])
-        self.name_box = TextBox(name_ax, "ROI name", initial=self._current_region_data()["name"])
-        self.name_box.on_submit(self._on_name_submit)
-        self.widgets.append(self.name_box)
-
-        camera_ax = self.fig.add_axes([controls_x0 + 0.32, 0.158, 0.17, 0.06])
-        labels = [CAMERA_MODEL_LABELS[model] for model in CAMERA_MODEL_CHOICES]
-        active = CAMERA_MODEL_CHOICES.index(self.camera_model)
-        self.camera_selector = RadioButtons(camera_ax, labels, active=active)
-        self.camera_selector.on_clicked(self._on_camera_model_select)
-        self.widgets.append(self.camera_selector)
 
         self.fig.canvas.mpl_connect("button_press_event", self._on_click)
         self.fig.canvas.mpl_connect("motion_notify_event", self._on_draw)
         self.fig.canvas.mpl_connect("button_release_event", self._on_release)
         self.fig.canvas.mpl_connect("key_press_event", self._on_key)
 
+    def _start_view_setup(self) -> None:
+        """Start embedded single-window camera/view setup."""
+        self.setup_controller = EmbeddedViewSetupController(
+            session=self.session,
+            output_dir=self.output_dir,
+            preview_max_side=self.preview_max_side,
+            fig=self.fig,
+            ax=self.ax,
+            image_artist=self.image_artist,
+            status=self.status,
+            help_text=self.help_text,
+            widgets=self.widgets,
+            clear_dynamic_artists=self._clear_dynamic_artists,
+            on_done=self._enter_annotation_session,
+            fov_deg=self.fov_deg,
+            fallback_fov_deg=FALLBACK_FOV_DEG,
+        )
+        self.setup_controller.start()
+
+    def _enter_annotation_session(self, session: AnnotationSession) -> None:
+        """Activate the selected original-resolution annotation view."""
+        self.session = session
+        self.image_path = session.image_path
+        self.source_image_path = session.source_image_path if session.view_metadata is not None else self.source_image_path
+        self.view_metadata = session.view_metadata
+        self.camera_model = _normalize_camera_model(session.camera_model)
+        self.fov_deg = session.fov_deg
+        self.image_view = session.active_view
+        self.original_width = self.image_view.width
+        self.original_height = self.image_view.height
+        self.image = self.image_view.preview
+        self.height, self.width = self.image.shape[:2]
+        self.preview_width = self.width
+        self.preview_height = self.height
+        self.is_downsampled = self.image_view.is_downsampled
+        self.brush_radius = max(4, int(round(min(self.height, self.width) * 0.02)))
+        self.json_path = self.output_dir / f"{Path(self.image_path).stem}.json"
+        self._set_camera_model(self.camera_model)
+        set_image_artist(self.image_artist, self.ax, self.image)
+        self.mask_artist.set_data(np.zeros((self.height, self.width, 4), dtype=np.float32))
+        self.mask_artist.set_extent((-0.5, self.width - 0.5, self.height - 0.5, -0.5))
+        self.lines.clear()
+        self.pending_line = None
+        self.current_line_points = []
+        self.regions.clear()
+        self.next_region_idx = 1
+        self._add_region()
+        self.current_region = len(self.regions) - 1
+        self.phase = "roi"
+        self.mode = "region"
+        self.status_extra = "Draw the current ROI draft."
+        self._set_roi_controls()
+        self._refresh()
+
+    def _clear_controls(self) -> None:
+        """Remove the phase-specific controls."""
+        clear_widget_axes(self.widgets)
+
+    def _clear_dynamic_artists(self) -> None:
+        """Remove transient overlay artists."""
+        for artist in self._dynamic_artists:
+            try:
+                artist.remove()
+            except ValueError:
+                pass
+        self._dynamic_artists.clear()
+
+    def _add_centered_button_row(self, buttons: list[tuple[str, float, Any]], y0: float) -> None:
+        """Add a centered row of buttons."""
+        add_button_row(self.fig, self.widgets, buttons, y0=y0)
+
+    def _set_roi_controls(self) -> None:
+        """Show ROI setup controls."""
+        self._clear_controls()
+        self._add_centered_button_row(
+            [
+                ("Redraw", 0.09, self._button_redraw_region),
+                ("Next ROI", 0.105, self._button_next_region),
+                ("Brush -", 0.085, self._button_brush_down),
+                ("Brush +", 0.085, self._button_brush_up),
+                ("Done ROI", 0.105, self._button_done_regions),
+            ],
+            0.075,
+        )
+
+    def _set_line_controls(self) -> None:
+        """Show line annotation controls after ROI setup is locked."""
+        self._clear_controls()
+        self._add_centered_button_row(
+            [
+                ("Redraw", 0.09, self._button_redraw_line),
+                ("Next", 0.09, self._button_next_line),
+                ("Save", 0.075, self._button_save),
+                ("Save+Close", 0.120, self._button_save_close),
+            ],
+            0.075,
+        )
+
     def _add_region(self, name: str | None = None) -> None:
         """Create a new empty ROI mask and select it."""
-        idx = len(self.regions) + 1
-        region_name = name or f"region_{idx}"
+        if name is None:
+            region_name = f"region_{self.next_region_idx}"
+            self.next_region_idx += 1
+        else:
+            region_name = name
         self.regions.append(
             {
                 "name": region_name,
-                "mask": np.zeros((self.height, self.width), dtype=bool),
+                "mask": np.zeros((self.original_height, self.original_width), dtype=bool),
             }
         )
         self.current_region = len(self.regions) - 1
@@ -445,78 +501,114 @@ class AnnotationGUI:
 
     def _set_mode(self, mode: str) -> None:
         """Switch interaction mode."""
+        if mode == "region" and self.phase != "roi":
+            self.status_extra = "ROI setup is locked."
+            self._refresh()
+            return
+        if mode == "line" and self.phase != "line":
+            self.status_extra = "Finish ROI setup before drawing lines."
+            self._refresh()
+            return
         self.mode = mode
         if mode != "line":
             self._drawing_line = False
             self.current_line_points = []
         self._refresh()
 
-    def _sync_name_box(self) -> None:
-        """Synchronize the ROI name text box with the selected region."""
-        if not hasattr(self, "name_box"):
+    def _button_done_regions(self, _event: object) -> None:
+        """Lock ROI masks and switch to line annotation."""
+        if self.phase != "roi":
             return
-        self._syncing_name = True
-        self.name_box.set_val(self._current_region_data()["name"])
-        self._syncing_name = False
-
-    def _on_name_submit(self, text: str) -> None:
-        """Update the current ROI name from the text box."""
-        if self._syncing_name:
-            return
-        name = text.strip() or f"region_{self.current_region + 1}"
-        self._current_region_data()["name"] = name
+        self._drawing = False
+        self.phase = "line"
+        self.mode = "line"
+        self._drawing_line = False
+        self.current_line_points = []
+        self.pending_line = None
+        self.status_extra = "ROI setup locked. Draw a line draft."
+        self._set_line_controls()
         self._refresh()
 
-    def _on_camera_model_select(self, label: str) -> None:
-        """Update the annotation camera model from the GUI selector."""
-        model = CAMERA_MODEL_FROM_LABEL[label]
-        self._set_camera_model(model)
+    def _button_redraw_region(self, _event: object) -> None:
+        """Clear the current ROI draft."""
+        if self.phase != "roi":
+            self.status_extra = "ROI setup is locked."
+            self._refresh()
+            return
+        current = self._current_region_data()
+        current["mask"][:] = False
+        self._drawing = False
+        self.status_extra = "Current ROI draft cleared."
         self._refresh()
-
-    def _button_line(self, _event: object) -> None:
-        self._set_mode("line")
-
-    def _button_region(self, _event: object) -> None:
-        self._set_mode("region")
 
     def _button_new_region(self, _event: object) -> None:
-        self._add_region()
-        self._sync_name_box()
-        self._set_mode("region")
-
-    def _button_prev_region(self, _event: object) -> None:
-        self.current_region = (self.current_region - 1) % len(self.regions)
-        self._sync_name_box()
-        self._set_mode("region")
+        if self.phase != "roi":
+            self.status_extra = "ROI setup is locked."
+            self._refresh()
+            return
+        self._button_next_region(_event)
 
     def _button_next_region(self, _event: object) -> None:
-        self.current_region = (self.current_region + 1) % len(self.regions)
-        self._sync_name_box()
-        self._set_mode("region")
+        if self.phase != "roi":
+            self.status_extra = "ROI setup is locked."
+            self._refresh()
+            return
+        current = self._current_region_data()
+        if not bool(current["mask"].any()):
+            self.status_extra = "Current ROI draft is empty."
+            self._refresh()
+            return
+        self._add_region()
+        self.mode = "region"
+        self._drawing = False
+        self.status_extra = f"Accepted ROI {len(self.regions) - 1}. Draw the next ROI draft."
+        self._refresh()
 
     def _button_brush_down(self, _event: object) -> None:
+        if self.phase != "roi":
+            self.status_extra = "ROI setup is locked."
+            self._refresh()
+            return
         self.brush_radius = max(1, self.brush_radius - 2)
         self._refresh()
 
     def _button_brush_up(self, _event: object) -> None:
+        if self.phase != "roi":
+            self.status_extra = "ROI setup is locked."
+            self._refresh()
+            return
         self.brush_radius = min(max(self.height, self.width), self.brush_radius + 2)
         self._refresh()
 
-    def _button_undo(self, _event: object) -> None:
-        self._undo()
+    def _button_redraw_line(self, _event: object) -> None:
+        """Clear the current pending line draft."""
+        if self.phase != "line":
+            return
+        self.pending_line = None
+        self.current_line_points = []
+        self._drawing_line = False
+        self.status_extra = "Pending line cleared. Draw again."
+        self._refresh()
 
-    def _button_clear_region(self, _event: object) -> None:
-        self._clear_current_region()
+    def _button_next_line(self, _event: object) -> None:
+        """Accept the pending line draft."""
+        if self.phase != "line":
+            return
+        if self._accept_pending_line():
+            self.status_extra = f"Accepted line {len(self.lines)}. Draw the next line draft."
+        else:
+            self.status_extra = "No pending line to accept."
+        self._refresh()
 
     def _button_save(self, _event: object) -> None:
         self._save(str(self.json_path))
         self._refresh()
 
     def _button_save_close(self, _event: object) -> None:
-        self._save(str(self.json_path))
-        import matplotlib.pyplot as plt
+        if self._save(str(self.json_path)):
+            import matplotlib.pyplot as plt
 
-        plt.close(self.fig)
+            plt.close(self.fig)
 
     def _clip_xy(self, x: float, y: float) -> tuple[float, float]:
         """Clip floating preview coordinates into the preview image extent."""
@@ -526,16 +618,19 @@ class AnnotationGUI:
 
     def _preview_to_original_xy(self, x: float, y: float) -> tuple[float, float]:
         """Map preview pixel coordinates back to original image coordinates."""
-        if self.width == self.original_width and self.height == self.original_height:
-            x_original = x
-            y_original = y
-        else:
-            x_original = (x + 0.5) * (self.original_width / self.width) - 0.5
-            y_original = (y + 0.5) * (self.original_height / self.height) - 0.5
+        return self.image_view.preview_to_image_xy(x, y)
 
-        x_original = float(np.clip(x_original, 0.0, self.original_width - 1.0))
-        y_original = float(np.clip(y_original, 0.0, self.original_height - 1.0))
-        return x_original, y_original
+    def _original_to_preview_points(self, points: list[tuple[float, float]]) -> np.ndarray:
+        """Map original image points to preview coordinates."""
+        if not points:
+            return np.empty((0, 2), dtype=np.float32)
+        return self.image_view.image_to_preview_points(np.asarray(points, dtype=np.float64))
+
+    def _line_min_spacing_original(self) -> float:
+        """Return the line spacing threshold in original image pixels."""
+        scale_x = self.original_width / max(float(self.width), 1.0)
+        scale_y = self.original_height / max(float(self.height), 1.0)
+        return LINE_MIN_SPACING_PX * max(scale_x, scale_y)
 
     def _mask_to_original_size(self, mask: np.ndarray) -> np.ndarray:
         """Resize a preview-space boolean mask back to original image resolution."""
@@ -549,20 +644,32 @@ class AnnotationGUI:
         )
         return np.asarray(mask_image) > 127
 
+    def _mask_to_preview_size(self, mask: np.ndarray) -> np.ndarray:
+        """Resize an original-space boolean mask into preview space."""
+        return self.image_view.mask_to_preview(mask)
+
     def _on_click(self, event: object) -> None:
         """Matplotlib mouse click handler.
 
         Args:
             event: A ``matplotlib.backend_bases.MouseEvent``.
         """
+        if self.phase == "setup" and self.setup_controller is not None:
+            if self.setup_controller.on_click(event):
+                return
         if getattr(event, "inaxes", None) is not self.ax:
             return
         if getattr(event, "xdata", None) is None or getattr(event, "ydata", None) is None:
             return
 
-        x, y = self._clip_xy(float(event.xdata), float(event.ydata))
+        preview_x, preview_y = self._clip_xy(float(event.xdata), float(event.ydata))
+        x, y = self._preview_to_original_xy(preview_x, preview_y)
         button = getattr(event, "button", None)
-        if self.mode == "line":
+        if self.phase == "line" and self.mode == "line":
+            if self.pending_line is not None:
+                self.status_extra = "Choose Redraw or Next before drawing another line."
+                self._refresh()
+                return
             if button == 1:
                 self._drawing_line = True
                 self.current_line_points = [(x, y)]
@@ -572,10 +679,9 @@ class AnnotationGUI:
             self._refresh()
             return
 
-        if self.mode == "region" and button in (1, 3):
+        if self.phase == "roi" and self.mode == "region" and button == 1:
             self._drawing = True
-            self._stroke_value = button == 1
-            self._stroke_snapshot = self._current_region_data()["mask"].copy()
+            self._stroke_value = True
             self._paint_at(x, y, self._stroke_value)
             self._refresh()
 
@@ -585,38 +691,47 @@ class AnnotationGUI:
         Args:
             event: A ``matplotlib.backend_bases.MouseEvent``.
         """
+        if self.phase == "setup" and self.setup_controller is not None:
+            if self.setup_controller.on_motion(event):
+                return
         if getattr(event, "inaxes", None) is not self.ax:
             return
         if getattr(event, "xdata", None) is None or getattr(event, "ydata", None) is None:
             return
 
-        if self.mode == "line" and self._drawing_line:
-            x, y = self._clip_xy(float(event.xdata), float(event.ydata))
+        if self.phase == "line" and self.mode == "line" and self._drawing_line:
+            preview_x, preview_y = self._clip_xy(float(event.xdata), float(event.ydata))
+            x, y = self._preview_to_original_xy(preview_x, preview_y)
             if not self.current_line_points:
                 self.current_line_points = [(x, y)]
             else:
                 last_x, last_y = self.current_line_points[-1]
-                if math.hypot(x - last_x, y - last_y) >= LINE_MIN_SPACING_PX:
+                if math.hypot(x - last_x, y - last_y) >= self._line_min_spacing_original():
                     self.current_line_points.append((x, y))
             self._refresh()
             return
 
-        if not self._drawing or self.mode != "region":
+        if self.phase != "roi" or not self._drawing or self.mode != "region":
             return
 
-        x, y = self._clip_xy(float(event.xdata), float(event.ydata))
+        preview_x, preview_y = self._clip_xy(float(event.xdata), float(event.ydata))
+        x, y = self._preview_to_original_xy(preview_x, preview_y)
         self._paint_at(x, y, self._stroke_value)
         self._refresh()
 
     def _on_release(self, event: object) -> None:
-        """Finish a line or paint stroke and store it in undo history."""
-        if self.mode == "line" and self._drawing_line:
+        """Finish a line or paint stroke."""
+        if self.phase == "setup" and self.setup_controller is not None:
+            if self.setup_controller.on_release(event):
+                return
+        if self.phase == "line" and self.mode == "line" and self._drawing_line:
             if (
                 getattr(event, "inaxes", None) is self.ax
                 and getattr(event, "xdata", None) is not None
                 and getattr(event, "ydata", None) is not None
             ):
-                x, y = self._clip_xy(float(event.xdata), float(event.ydata))
+                preview_x, preview_y = self._clip_xy(float(event.xdata), float(event.ydata))
+                x, y = self._preview_to_original_xy(preview_x, preview_y)
                 if self.current_line_points:
                     last_x, last_y = self.current_line_points[-1]
                     if math.hypot(x - last_x, y - last_y) > 0.0:
@@ -625,11 +740,12 @@ class AnnotationGUI:
             self._drawing_line = False
             if (
                 len(self.current_line_points) >= 2
-                and _polyline_length(self.current_line_points) >= LINE_MIN_SPACING_PX
+                and _polyline_length(self.current_line_points) >= self._line_min_spacing_original()
             ):
-                resampled = _resample_polyline(self.current_line_points, LINE_RESAMPLE_POINTS)
-                self.lines.append(resampled)
-                self.history.append(("line", None))
+                self.pending_line = _resample_polyline(self.current_line_points, LINE_RESAMPLE_POINTS)
+                self.status_extra = "Pending line ready. Choose Redraw or Next."
+            else:
+                self.status_extra = "Line draft is too short."
             self.current_line_points = []
             self._refresh()
             return
@@ -637,41 +753,30 @@ class AnnotationGUI:
         if not self._drawing:
             return
         self._drawing = False
-        mask = self._current_region_data()["mask"]
-        if self._stroke_snapshot is not None and not np.array_equal(mask, self._stroke_snapshot):
-            self.history.append(("mask", self.current_region, self._stroke_snapshot))
-        self._stroke_snapshot = None
         self._refresh()
 
     def _on_key(self, event: object) -> None:
         """Keyboard shortcut handler."""
         key = (getattr(event, "key", "") or "").lower()
-        if key in ("l",):
-            self._set_mode("line")
-        elif key in ("r",):
-            self._set_mode("region")
-        elif key in ("n",):
-            self._button_new_region(event)
-        elif key in ("[",):
-            self._button_prev_region(event)
-        elif key in ("]", "tab"):
+        if self.phase == "setup" and self.setup_controller is not None:
+            if self.setup_controller.on_key(event):
+                return
+        if key in ("d", "enter") and self.phase == "roi":
+            self._button_done_regions(event)
+        elif key in ("n", "tab") and self.phase == "roi":
             self._button_next_region(event)
-        elif key in ("+", "="):
+        elif key in ("r", "escape") and self.phase == "roi":
+            self._button_redraw_region(event)
+        elif key in ("+", "=") and self.phase == "roi":
             self._button_brush_up(event)
-        elif key in ("-", "_"):
+        elif key in ("-", "_") and self.phase == "roi":
             self._button_brush_down(event)
-        elif key in ("u", "ctrl+z", "cmd+z"):
-            self._undo()
-        elif key in ("c",):
-            self._clear_current_region()
+        elif key in ("r", "escape") and self.phase == "line":
+            self._button_redraw_line(event)
+        elif key in ("n", "enter", " ", "tab") and self.phase == "line":
+            self._button_next_line(event)
         elif key in ("s", "ctrl+s", "cmd+s"):
             self._save(str(self.json_path))
-            self._refresh()
-        elif key == "escape":
-            self._drawing_line = False
-            self.current_line_points = []
-            self._drawing = False
-            self._stroke_snapshot = None
             self._refresh()
 
     def _paint_at(self, x: float, y: float, value: bool) -> None:
@@ -679,39 +784,17 @@ class AnnotationGUI:
         mask = self._current_region_data()["mask"]
         cx = int(round(x))
         cy = int(round(y))
-        radius = int(self.brush_radius)
+        scale_x = self.original_width / max(float(self.width), 1.0)
+        scale_y = self.original_height / max(float(self.height), 1.0)
+        radius = max(1, int(round(self.brush_radius * max(scale_x, scale_y))))
         x0 = max(0, cx - radius)
-        x1 = min(self.width - 1, cx + radius)
+        x1 = min(self.original_width - 1, cx + radius)
         y0 = max(0, cy - radius)
-        y1 = min(self.height - 1, cy + radius)
+        y1 = min(self.original_height - 1, cy + radius)
         yy, xx = np.ogrid[y0 : y1 + 1, x0 : x1 + 1]
         disk = (xx - cx) * (xx - cx) + (yy - cy) * (yy - cy) <= radius * radius
         patch = mask[y0 : y1 + 1, x0 : x1 + 1]
         patch[disk] = value
-
-    def _clear_current_region(self) -> None:
-        """Clear the selected ROI mask while preserving undo history."""
-        mask = self._current_region_data()["mask"]
-        before = mask.copy()
-        if bool(mask.any()):
-            mask[:] = False
-            self.history.append(("mask", self.current_region, before))
-        self._refresh()
-
-    def _undo(self) -> None:
-        """Undo the most recent line or mask stroke."""
-        if not self.history:
-            return
-        action = self.history.pop()
-        if action[0] == "line" and self.lines:
-            self.lines.pop()
-        elif action[0] == "mask":
-            _, region_idx, previous = action
-            if 0 <= region_idx < len(self.regions):
-                self.regions[region_idx]["mask"] = previous.copy()
-                self.current_region = region_idx
-                self._sync_name_box()
-        self._refresh()
 
     def _mask_overlay(self) -> np.ndarray:
         """Build the RGBA overlay for all ROI masks."""
@@ -730,29 +813,33 @@ class AnnotationGUI:
             mask = region["mask"]
             if not bool(mask.any()):
                 continue
+            preview_mask = self._mask_to_preview_size(mask)
             color = colors[idx % len(colors)]
             alpha = 0.40 if idx == self.current_region else 0.22
-            overlay[mask, :3] = color
-            overlay[mask, 3] = alpha
+            overlay[preview_mask, :3] = color
+            overlay[preview_mask, 3] = alpha
         return overlay
 
     def _refresh(self) -> None:
         """Redraw overlays, lines, and status text."""
+        if self.phase == "setup":
+            self.fig.canvas.draw_idle()
+            return
         self.mask_artist.set_data(self._mask_overlay())
-        for artist in self._dynamic_artists:
-            artist.remove()
-        self._dynamic_artists.clear()
+        self._clear_dynamic_artists()
 
         for idx, points in enumerate(self.lines, start=1):
-            xs = [p[0] for p in points]
-            ys = [p[1] for p in points]
+            preview_points = self._original_to_preview_points(points)
+            xs = preview_points[:, 0]
+            ys = preview_points[:, 1]
             line_artist = self.ax.plot(
                 xs,
                 ys,
                 color="lime",
                 linewidth=2.0,
             )[0]
-            label_x, label_y = points[-1]
+            label_x = float(preview_points[-1, 0])
+            label_y = float(preview_points[-1, 1])
             label = self.ax.text(
                 label_x,
                 label_y,
@@ -763,9 +850,21 @@ class AnnotationGUI:
             )
             self._dynamic_artists.extend((line_artist, label))
 
+        if self.pending_line is not None:
+            preview_points = self._original_to_preview_points(self.pending_line)
+            pending_artist = self.ax.plot(
+                preview_points[:, 0],
+                preview_points[:, 1],
+                color="#ff3333",
+                linewidth=2.8,
+                zorder=6,
+            )[0]
+            self._dynamic_artists.append(pending_artist)
+
         if self.current_line_points:
-            xs = [p[0] for p in self.current_line_points]
-            ys = [p[1] for p in self.current_line_points]
+            preview_points = self._original_to_preview_points(self.current_line_points)
+            xs = preview_points[:, 0]
+            ys = preview_points[:, 1]
             active_line = self.ax.plot(
                 xs,
                 ys,
@@ -784,15 +883,31 @@ class AnnotationGUI:
         camera_text = f"Camera: {CAMERA_MODEL_LABELS[self.camera_model]}"
         if self.camera_model == "pinhole":
             camera_text += f" ({self.fov_deg:.2f} deg)"
+        phase_text = "ROI SETUP" if self.phase == "roi" else "LINES"
+        if self.phase == "setup":
+            phase_text = "VIEW SETUP"
         self.status.set_text(
-            f"Mode: {self.mode.upper()} | ROI {self.current_region + 1}/{len(self.regions)} "
-            f"'{current['name']}' ({pixels} preview px) | Lines: {len(self.lines)} | "
+            f"Phase: {phase_text} | Mode: {self.mode.upper()} | ROI {self.current_region + 1}/{len(self.regions)} "
+            f"'{current['name']}' ({pixels} original px) | Lines: {len(self.lines)} | "
             f"Brush: {self.brush_radius}px | {camera_text} | {size_text} | Save: {self.json_path}"
+            f" | {self.status_extra}"
         )
         self.fig.canvas.draw_idle()
 
+    def _accept_pending_line(self) -> bool:
+        """Move the pending line draft into accepted lines."""
+        if self.pending_line is None:
+            return False
+        self.lines.append(self.pending_line)
+        self.pending_line = None
+        self.current_line_points = []
+        self._drawing_line = False
+        return True
+
     def _line_json(self) -> list[dict[str, list[list[float]]]]:
         """Convert preview-space line curves into original view-sphere directions."""
+        if self.camera is None:
+            raise RuntimeError("Camera is not initialized.")
         result: list[dict[str, list[list[float]]]] = []
         for points in self.lines:
             if len(points) != LINE_RESAMPLE_POINTS:
@@ -801,9 +916,8 @@ class AnnotationGUI:
                     f"got {len(points)}."
                 )
 
-            original_points = [self._preview_to_original_xy(x, y) for x, y in points]
-            xs = np.array([p[0] for p in original_points], dtype=np.float64)
-            ys = np.array([p[1] for p in original_points], dtype=np.float64)
+            xs = np.array([p[0] for p in points], dtype=np.float64)
+            ys = np.array([p[1] for p in points], dtype=np.float64)
             lam, phi = self.camera.pixel_to_direction(xs, ys)
             points_dir = [
                 [float(lam_i), float(phi_i)]
@@ -812,12 +926,16 @@ class AnnotationGUI:
             result.append({"points_dir": points_dir})
         return result
 
-    def _save(self, json_path: str) -> None:
+    def _save(self, json_path: str) -> bool:
         """Write masks to disk and emit the annotation JSON.
 
         Args:
             json_path: Output JSON path.
         """
+        if self.phase != "line":
+            self.status_extra = "Press Done ROI before saving."
+            return False
+        self._accept_pending_line()
         json_out = Path(json_path).resolve()
         json_out.parent.mkdir(parents=True, exist_ok=True)
         used_names: set[str] = set()
@@ -836,8 +954,7 @@ class AnnotationGUI:
             used_names.add(unique_name)
 
             mask_path = json_out.parent / f"mask_{unique_name}.png"
-            original_mask = self._mask_to_original_size(mask)
-            Image.fromarray((original_mask.astype(np.uint8) * 255)).save(mask_path)
+            Image.fromarray((mask.astype(np.uint8) * 255)).save(mask_path)
             regions_json.append(
                 {
                     "name": str(region["name"]),
@@ -845,23 +962,26 @@ class AnnotationGUI:
                 }
             )
 
-        payload = {
-            "image_path": _relative_path(Path(self.image_path), json_out.parent),
-            "camera_model": self.camera_model,
-        }
-        if self.camera_model == "pinhole":
-            payload["fov_deg"] = self.fov_deg
-        payload["lines"] = self._line_json()
-        payload["regions"] = regions_json
-        json_out.write_text(json.dumps(payload, indent=4), encoding="utf-8")
+        payload = build_annotation_payload(
+            image_path=self.image_path,
+            output_path=json_out,
+            source_image_path=self.source_image_path,
+            camera_model=self.camera_model,
+            fov_deg=self.fov_deg if self.camera_model == "pinhole" else None,
+            view_metadata=self.view_metadata,
+            lines=self._line_json(),
+            regions=regions_json,
+        )
+        write_annotation_json(json_out, payload)
+        self.status_extra = f"Saved annotations to {json_out}."
+        return True
 
 
 def parse_args() -> argparse.Namespace:
     """Parse command-line arguments for the annotation tool.
 
     Returns:
-        Namespace with attributes: ``image`` (str), ``fov`` (float | None),
-        ``camera_model`` (str), ``output_dir`` (str | None).
+        Namespace with attributes: ``image`` (str), ``output_dir`` (str | None).
     """
     parser = argparse.ArgumentParser(description="MaDCoW annotation GUI.")
     parser.add_argument(
@@ -869,22 +989,6 @@ def parse_args() -> argparse.Namespace:
         nargs="?",
         default=str(DEFAULT_IMAGE),
         help=f"Path to the input image. Defaults to {DEFAULT_IMAGE}.",
-    )
-    parser.add_argument(
-        "--fov",
-        type=float,
-        default=None,
-        help=(
-            "Horizontal FOV in degrees for pinhole images. If omitted for "
-            "pinhole, EXIF is used when possible, otherwise 90. Ignored by "
-            "360 camera annotations."
-        ),
-    )
-    parser.add_argument(
-        "--camera-model",
-        choices=CAMERA_MODEL_CHOICES,
-        default="pinhole",
-        help="Input camera model to write into the annotation JSON.",
     )
     parser.add_argument(
         "--output-dir",
@@ -897,13 +1001,11 @@ def parse_args() -> argparse.Namespace:
 if __name__ == "__main__":
     args = parse_args()
     image_path = Path(args.image).resolve()
-    camera_model = _normalize_camera_model(args.camera_model)
-    if camera_model == "pinhole" and args.fov is None:
-        fov, source = estimate_fov_from_exif(str(image_path))
-        print(f"Using horizontal FOV {fov:.2f} degrees ({source}).")
-    else:
-        fov = args.fov
-        if camera_model == "360":
-            print("Using 360 camera model.")
+    fov, _source = estimate_fov_from_exif(str(image_path))
     output_dir = args.output_dir or str(image_path.parent)
-    AnnotationGUI(str(image_path), fov, output_dir, camera_model=camera_model).run()
+    AnnotationGUI(
+        str(image_path),
+        fov,
+        output_dir,
+        start_with_setup=True,
+    ).run()

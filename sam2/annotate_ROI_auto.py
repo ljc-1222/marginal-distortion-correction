@@ -20,6 +20,16 @@ from typing import Any, Iterator
 import numpy as np
 from PIL import ExifTags, Image
 
+from annotation_gui import AnnotationSession, load_image_view
+from annotation_gui.base import (
+    EmbeddedViewSetupController,
+    add_button_row,
+    clear_widget_axes,
+    create_image_figure,
+    set_image_artist,
+)
+from annotation_gui.io import build_annotation_payload, write_annotation_json
+
 
 SAM2_ROOT = Path(__file__).resolve().parent
 INNER_PACKAGE_DIR = SAM2_ROOT / "sam2"
@@ -242,6 +252,10 @@ class SAM2ROIAnnotationGUI:
         output_dir: str,
         predictor: Any,
         device: str,
+        camera_model: str = "pinhole",
+        source_image_path: str | None = None,
+        view_metadata: dict[str, Any] | None = None,
+        start_with_setup: bool = False,
     ) -> None:
         if fov_deg <= 0 or fov_deg >= 180:
             raise ValueError(f"fov_deg must lie in (0, 180); got {fov_deg}.")
@@ -252,26 +266,21 @@ class SAM2ROIAnnotationGUI:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.predictor = predictor
         self.device = device
+        self.camera_model = str(camera_model)
+        self.source_image_path = source_image_path
+        self.view_metadata = view_metadata
         self.preview_max_side = PREVIEW_MAX_SIDE
 
-        with Image.open(self.image_path) as img:
-            original_image = img.convert("RGB")
-            self.original_width, self.original_height = original_image.size
-            preview_size = _compute_preview_size(
-                self.original_width,
-                self.original_height,
-                self.preview_max_side,
-            )
-            preview_image = (
-                original_image
-                if preview_size == original_image.size
-                else original_image.resize(preview_size, _lanczos_resampling())
-            )
-            self.original_image = np.array(original_image)
-            self.image = np.array(preview_image)
+        self.session = AnnotationSession.from_image(self.image_path, self.preview_max_side, self.fov_deg)
+        self.image_view = load_image_view(self.image_path, self.preview_max_side)
+        self.original_image = self.image_view.image
+        self.original_width = self.image_view.width
+        self.original_height = self.image_view.height
+        self.image = self.image_view.preview
 
         self.height, self.width = self.image.shape[:2]
-        self.is_downsampled = self.width != self.original_width or self.height != self.original_height
+        self.is_downsampled = self.image_view.is_downsampled
+        self.phase = "setup" if start_with_setup else "roi"
         self.mode = "box"
         self.regions: list[dict[str, Any]] = []
         self.current_region = 0
@@ -280,18 +289,18 @@ class SAM2ROIAnnotationGUI:
         self._box_start: tuple[float, float] | None = None
         self._box_preview: tuple[float, float, float, float] | None = None
         self._dynamic_artists: list[Any] = []
-        self._syncing_name = False
+        self.setup_controller: EmbeddedViewSetupController | None = None
         self.message = ""
         self.json_path = self.output_dir / f"{Path(self.image_path).stem}.json"
 
-        print("Computing SAM2 image embedding...")
-        with _inference_context(self.device):
-            self.predictor.set_image(self.original_image)
-        print("Image embedding is ready.")
-
-        self._add_region()
         self._build_figure()
-        self._refresh()
+        if start_with_setup:
+            self._start_view_setup()
+        else:
+            self._prepare_predictor_for_active_image()
+            self._add_region()
+            self._set_roi_controls()
+            self._refresh()
 
     def run(self) -> None:
         """Open the Matplotlib GUI and block until it closes."""
@@ -301,51 +310,99 @@ class SAM2ROIAnnotationGUI:
 
     def _build_figure(self) -> None:
         """Create the figure, widgets, and event callbacks."""
-        import matplotlib.pyplot as plt
-        from matplotlib.widgets import Button, TextBox
-
-        self.fig, self.ax = plt.subplots(figsize=(12, 8))
-        self.fig.canvas.manager.set_window_title("SAM2 ROI Annotation Tool")
-        self.fig.subplots_adjust(left=0.03, right=0.99, bottom=0.20, top=0.94)
-        self.ax.imshow(self.image)
-        self.ax.set_xlim(-0.5, self.width - 0.5)
-        self.ax.set_ylim(self.height - 0.5, -0.5)
-        self.ax.set_aspect("equal")
-        self.ax.set_xticks([])
-        self.ax.set_yticks([])
+        self.fig, self.ax, self.image_artist, self.status, self.help_text = create_image_figure(
+            "SAM2 ROI Annotation Tool",
+            self.image,
+        )
         self.mask_artist = self.ax.imshow(np.zeros((self.height, self.width, 4)), interpolation="nearest")
-        self.status = self.fig.text(0.03, 0.965, "", ha="left", va="center", fontsize=10)
 
         self.widgets: list[Any] = []
-        buttons = [
-            ("Box", 0.075, self._button_box),
-            ("Point", 0.085, self._button_point),
-            ("New ROI", 0.095, self._button_new_region),
-            ("Prev", 0.075, self._button_prev_region),
-            ("Next", 0.075, self._button_next_region),
-            ("Reset ROI", 0.105, self._button_reset_region),
-            ("Save", 0.075, self._button_save),
-            ("Save+Close", 0.12, self._button_save_close),
-        ]
-        gap = 0.018
-        total_width = sum(width for _label, width, _callback in buttons) + gap * (len(buttons) - 1)
-        x0 = (1.0 - total_width) * 0.5
-        for label, width, callback in buttons:
-            ax_button = self.fig.add_axes([x0, 0.045, width, 0.045])
-            button = Button(ax_button, label)
-            button.on_clicked(callback)
-            self.widgets.append(button)
-            x0 += width + gap
-
-        name_ax = self.fig.add_axes([0.33, 0.11, 0.34, 0.045])
-        self.name_box = TextBox(name_ax, "ROI name", initial=self._current_region_data()["name"])
-        self.name_box.on_submit(self._on_name_submit)
-        self.widgets.append(self.name_box)
-
         self.fig.canvas.mpl_connect("button_press_event", self._on_click)
         self.fig.canvas.mpl_connect("motion_notify_event", self._on_motion)
         self.fig.canvas.mpl_connect("button_release_event", self._on_release)
         self.fig.canvas.mpl_connect("key_press_event", self._on_key)
+
+    def _clear_controls(self) -> None:
+        """Remove the current control widgets."""
+        clear_widget_axes(self.widgets)
+
+    def _clear_dynamic_artists(self) -> None:
+        """Remove transient overlay artists."""
+        for artist in self._dynamic_artists:
+            try:
+                artist.remove()
+            except ValueError:
+                pass
+        self._dynamic_artists.clear()
+
+    def _set_roi_controls(self) -> None:
+        """Show append-only ROI prompt controls."""
+        self._clear_controls()
+        buttons = [
+            ("Box", 0.075, self._button_box),
+            ("Point", 0.085, self._button_point),
+            ("Redraw", 0.09, self._button_redraw_region),
+            ("Next ROI", 0.105, self._button_next_region),
+            ("Save", 0.075, self._button_save),
+            ("Save+Close", 0.12, self._button_save_close),
+        ]
+        add_button_row(self.fig, self.widgets, buttons, y0=0.075)
+
+    def _start_view_setup(self) -> None:
+        """Start embedded single-window camera/view setup."""
+        self.setup_controller = EmbeddedViewSetupController(
+            session=self.session,
+            output_dir=self.output_dir,
+            preview_max_side=self.preview_max_side,
+            fig=self.fig,
+            ax=self.ax,
+            image_artist=self.image_artist,
+            status=self.status,
+            help_text=self.help_text,
+            widgets=self.widgets,
+            clear_dynamic_artists=self._clear_dynamic_artists,
+            on_done=self._enter_annotation_session,
+            fov_deg=self.fov_deg,
+            fallback_fov_deg=FALLBACK_FOV_DEG,
+        )
+        self.setup_controller.start()
+
+    def _enter_annotation_session(self, session: AnnotationSession) -> None:
+        """Activate the selected original-resolution annotation view."""
+        self.session = session
+        self.image_path = session.image_path
+        self.source_image_path = session.source_image_path if session.view_metadata is not None else self.source_image_path
+        self.view_metadata = session.view_metadata
+        self.camera_model = str(session.camera_model)
+        self.fov_deg = float(session.fov_deg)
+        self.image_view = session.active_view
+        self.original_image = self.image_view.image
+        self.original_width = self.image_view.width
+        self.original_height = self.image_view.height
+        self.image = self.image_view.preview
+        self.height, self.width = self.image.shape[:2]
+        self.is_downsampled = self.image_view.is_downsampled
+        self.json_path = self.output_dir / f"{Path(self.image_path).stem}.json"
+        set_image_artist(self.image_artist, self.ax, self.image)
+        self.mask_artist.set_data(np.zeros((self.height, self.width, 4), dtype=np.float32))
+        self.mask_artist.set_extent((-0.5, self.width - 0.5, self.height - 0.5, -0.5))
+        self._prepare_predictor_for_active_image()
+        self.regions.clear()
+        self.next_region_idx = 1
+        self._add_region()
+        self.current_region = len(self.regions) - 1
+        self.phase = "roi"
+        self.mode = "box"
+        self.message = "Draw a box or add a point for the current ROI draft."
+        self._set_roi_controls()
+        self._refresh()
+
+    def _prepare_predictor_for_active_image(self) -> None:
+        """Compute SAM2 image embedding for the active original-resolution image."""
+        print("Computing SAM2 image embedding...")
+        with _inference_context(self.device):
+            self.predictor.set_image(self.original_image)
+        print("Image embedding is ready.")
 
     def _add_region(self, name: str | None = None) -> None:
         """Create and select a new empty ROI prompt."""
@@ -369,21 +426,6 @@ class SAM2ROIAnnotationGUI:
         """Return the selected ROI data dictionary."""
         return self.regions[self.current_region]
 
-    def _sync_name_box(self) -> None:
-        """Synchronize the ROI name text box with the selected ROI."""
-        if not hasattr(self, "name_box"):
-            return
-        self._syncing_name = True
-        self.name_box.set_val(self._current_region_data()["name"])
-        self._syncing_name = False
-
-    def _on_name_submit(self, text: str) -> None:
-        """Update the current ROI name from the text box."""
-        if self._syncing_name:
-            return
-        self._current_region_data()["name"] = text.strip() or f"region_{self.current_region + 1}"
-        self._refresh()
-
     def _button_box(self, _event: object) -> None:
         self._set_mode("box")
 
@@ -391,17 +433,39 @@ class SAM2ROIAnnotationGUI:
         self._set_mode("point")
 
     def _button_new_region(self, _event: object) -> None:
-        self._add_region()
-        self._select_region(len(self.regions) - 1, self.mode)
-
-    def _button_prev_region(self, _event: object) -> None:
-        self._select_region((self.current_region - 1) % len(self.regions), self.mode)
+        self._button_next_region(_event)
 
     def _button_next_region(self, _event: object) -> None:
-        self._select_region((self.current_region + 1) % len(self.regions), self.mode)
+        if self.phase != "roi":
+            return
+        current = self._current_region_data()
+        mask = current["mask"]
+        if mask is None or not bool(mask.any()):
+            self.message = "Current ROI draft has no mask."
+            self._refresh()
+            return
+        accepted_idx = self.current_region + 1
+        self._add_region()
+        self.mode = "box"
+        self._dragging_box = False
+        self._box_start = None
+        self._box_preview = None
+        self.message = f"Accepted ROI {accepted_idx}. Draw the next ROI draft."
+        self._refresh()
 
-    def _button_reset_region(self, _event: object) -> None:
-        self._reset_current_region()
+    def _button_redraw_region(self, _event: object) -> None:
+        if self.phase != "roi":
+            return
+        current = self._current_region_data()
+        current["box"] = None
+        current["points"] = []
+        current["mask"] = None
+        current["score"] = None
+        self._dragging_box = False
+        self._box_start = None
+        self._box_preview = None
+        self.message = "Current ROI draft cleared."
+        self._refresh()
 
     def _button_save(self, _event: object) -> None:
         self._save(str(self.json_path))
@@ -415,23 +479,12 @@ class SAM2ROIAnnotationGUI:
 
     def _set_mode(self, mode: str) -> None:
         """Switch interaction mode."""
+        if self.phase != "roi":
+            return
         self.mode = mode
         self._dragging_box = False
         self._box_start = None
         self._box_preview = None
-        self._refresh()
-
-    def _select_region(self, region_idx: int, mode: str | None = None) -> None:
-        """Select an ROI while preserving or explicitly setting the prompt mode."""
-        self.current_region = region_idx % len(self.regions)
-        if mode is not None:
-            self.mode = mode
-        self._dragging_box = False
-        self._box_start = None
-        self._box_preview = None
-        self._sync_name_box()
-        current = self._current_region_data()
-        self.message = f"Selected ROI {self.current_region + 1}: {current['name']}."
         self._refresh()
 
     def _clip_xy(self, x: float, y: float) -> tuple[float, float]:
@@ -440,16 +493,16 @@ class SAM2ROIAnnotationGUI:
 
     def _preview_to_original_xy(self, x: float, y: float) -> tuple[float, float]:
         """Map preview coordinates back to original image coordinates."""
-        if self.width == self.original_width and self.height == self.original_height:
-            x_original = x
-            y_original = y
-        else:
-            x_original = (x + 0.5) * (self.original_width / self.width) - 0.5
-            y_original = (y + 0.5) * (self.original_height / self.height) - 0.5
-        return (
-            float(np.clip(x_original, 0.0, self.original_width - 1.0)),
-            float(np.clip(y_original, 0.0, self.original_height - 1.0)),
-        )
+        return self.image_view.preview_to_image_xy(x, y)
+
+    def _original_to_preview_xy(self, x: float, y: float) -> tuple[float, float]:
+        """Map original image coordinates to preview coordinates."""
+        mapped = self.image_view.image_to_preview_points(np.asarray([[x, y]], dtype=np.float64))
+        return float(mapped[0, 0]), float(mapped[0, 1])
+
+    def _original_box_to_preview(self, box: tuple[float, float, float, float]) -> tuple[float, float, float, float]:
+        """Map an original-image box to preview coordinates."""
+        return self.image_view.image_to_preview_box(box)
 
     def _preview_box_to_original(self, box: tuple[float, float, float, float]) -> np.ndarray:
         """Map a preview-space box to original-image XYXY coordinates."""
@@ -468,6 +521,11 @@ class SAM2ROIAnnotationGUI:
 
     def _on_click(self, event: object) -> None:
         """Handle prompt clicks and box starts."""
+        if self.phase == "setup" and self.setup_controller is not None:
+            if self.setup_controller.on_click(event):
+                return
+        if self.phase != "roi":
+            return
         if getattr(event, "inaxes", None) is not self.ax:
             return
         if getattr(event, "xdata", None) is None or getattr(event, "ydata", None) is None:
@@ -484,12 +542,17 @@ class SAM2ROIAnnotationGUI:
             self._refresh()
             return
 
-        current["points"].append((x, y))
+        current["points"].append(self._preview_to_original_xy(x, y))
         self._predict_current_region()
         self._refresh()
 
     def _on_motion(self, event: object) -> None:
         """Update the box preview while dragging."""
+        if self.phase == "setup" and self.setup_controller is not None:
+            if self.setup_controller.on_motion(event):
+                return
+        if self.phase != "roi":
+            return
         if not self._dragging_box or self._box_start is None:
             return
         if getattr(event, "inaxes", None) is not self.ax:
@@ -504,6 +567,11 @@ class SAM2ROIAnnotationGUI:
 
     def _on_release(self, event: object) -> None:
         """Finish a box prompt and run prediction."""
+        if self.phase == "setup" and self.setup_controller is not None:
+            if self.setup_controller.on_release(event):
+                return
+        if self.phase != "roi":
+            return
         if not self._dragging_box or self._box_start is None:
             return
         self._dragging_box = False
@@ -523,25 +591,26 @@ class SAM2ROIAnnotationGUI:
         self._box_preview = None
 
         if box[2] - box[0] >= 2.0 and box[3] - box[1] >= 2.0:
-            self._current_region_data()["box"] = box
+            self._current_region_data()["box"] = tuple(float(v) for v in self._preview_box_to_original(box))
             self._predict_current_region()
         self._refresh()
 
     def _on_key(self, event: object) -> None:
         """Keyboard shortcut handler."""
         key = (getattr(event, "key", "") or "").lower()
+        if self.phase == "setup" and self.setup_controller is not None:
+            if self.setup_controller.on_key(event):
+                return
+        if self.phase != "roi":
+            return
         if key == "b":
             self._set_mode("box")
         elif key in ("p", "f"):
             self._set_mode("point")
-        elif key == "n":
+        elif key in ("n", "tab"):
             self._button_new_region(event)
-        elif key == "[":
-            self._button_prev_region(event)
-        elif key in ("]", "tab"):
-            self._button_next_region(event)
         elif key in ("r", "c"):
-            self._reset_current_region()
+            self._button_redraw_region(event)
         elif key in ("s", "ctrl+s", "cmd+s"):
             self._save(str(self.json_path))
             self._refresh()
@@ -550,19 +619,6 @@ class SAM2ROIAnnotationGUI:
             self._box_start = None
             self._box_preview = None
             self._refresh()
-
-    def _reset_current_region(self) -> None:
-        """Clear the current ROI prompts and predicted mask."""
-        current = self._current_region_data()
-        current["box"] = None
-        current["points"] = []
-        current["mask"] = None
-        current["score"] = None
-        self._box_start = None
-        self._box_preview = None
-        self._dragging_box = False
-        self.message = "Current ROI reset."
-        self._refresh()
 
     def _predict_current_region(self) -> None:
         """Run SAM2 prediction for the current ROI prompt."""
@@ -578,11 +634,10 @@ class SAM2ROIAnnotationGUI:
         point_coords = None
         point_labels = None
         if points:
-            original_points = [self._preview_to_original_xy(float(x), float(y)) for x, y in points]
-            point_coords = np.array(original_points, dtype=np.float32)
+            point_coords = np.array(points, dtype=np.float32)
             point_labels = np.ones(len(points), dtype=np.int32)
 
-        input_box = self._preview_box_to_original(box) if box is not None else None
+        input_box = np.array(box, dtype=np.float32) if box is not None else None
         multimask_output = bool(input_box is None and len(points) <= 1)
 
         self.message = "Predicting ROI mask..."
@@ -638,17 +693,19 @@ class SAM2ROIAnnotationGUI:
 
     def _refresh(self) -> None:
         """Redraw mask, prompt overlays, and status text."""
+        if self.phase == "setup":
+            self.fig.canvas.draw_idle()
+            return
         self.mask_artist.set_data(self._mask_overlay())
-        for artist in self._dynamic_artists:
-            artist.remove()
-        self._dynamic_artists.clear()
+        self._clear_dynamic_artists()
 
         from matplotlib.patches import Rectangle
 
         for idx, region in enumerate(self.regions, start=1):
             box = self._box_preview if idx - 1 == self.current_region and self._box_preview else region["box"]
             if box is not None:
-                x0, y0, x1, y1 = _normalize_box(box)
+                preview_box = box if box is self._box_preview else self._original_box_to_preview(box)
+                x0, y0, x1, y1 = _normalize_box(preview_box)
                 edge_color = tuple(self._region_color(idx - 1)[0].tolist())
                 rectangle = Rectangle(
                     (x0, y0),
@@ -661,7 +718,8 @@ class SAM2ROIAnnotationGUI:
                 self.ax.add_patch(rectangle)
                 self._dynamic_artists.append(rectangle)
 
-            for x, y in region["points"]:
+            for x_original, y_original in region["points"]:
+                x, y = self._original_to_preview_xy(float(x_original), float(y_original))
                 is_current = idx - 1 == self.current_region
                 point_color = tuple(self._region_color(idx - 1)[0].tolist())
                 marker = self.ax.scatter(
@@ -708,11 +766,11 @@ class SAM2ROIAnnotationGUI:
     def _region_label_position(self, region: dict[str, Any]) -> tuple[float, float]:
         """Return a stable preview-space label position for a region."""
         if region["box"] is not None:
-            x0, y0, _x1, _y1 = _normalize_box(region["box"])
+            x0, y0, _x1, _y1 = _normalize_box(self._original_box_to_preview(region["box"]))
             return x0, y0
         if region["points"]:
-            x, y = region["points"][0]
-            return float(x), float(y)
+            x, y = self._original_to_preview_xy(float(region["points"][0][0]), float(region["points"][0][1]))
+            return x, y
         mask = region["mask"]
         if mask is None or not bool(mask.any()):
             return 0.0, 0.0
@@ -748,13 +806,17 @@ class SAM2ROIAnnotationGUI:
                 }
             )
 
-        payload = {
-            "image_path": _relative_path(Path(self.image_path), json_out.parent),
-            "fov_deg": self.fov_deg,
-            "lines": [],
-            "regions": regions_json,
-        }
-        json_out.write_text(json.dumps(payload, indent=4), encoding="utf-8")
+        payload = build_annotation_payload(
+            image_path=self.image_path,
+            output_path=json_out,
+            source_image_path=self.source_image_path,
+            camera_model=self.camera_model,
+            fov_deg=self.fov_deg,
+            view_metadata=self.view_metadata,
+            lines=[],
+            regions=regions_json,
+        )
+        write_annotation_json(json_out, payload)
         self.message = f"Saved {len(regions_json)} ROI mask(s) to {json_out}."
 
 
@@ -765,12 +827,6 @@ def parse_args() -> argparse.Namespace:
         "--image",
         default=str(DEFAULT_IMAGE),
         help=f"Path to the input image. Defaults to {DEFAULT_IMAGE}.",
-    )
-    parser.add_argument(
-        "--fov",
-        type=float,
-        default=None,
-        help="Horizontal FOV in degrees. If omitted, EXIF is used when possible, otherwise 90.",
     )
     parser.add_argument(
         "--output-dir",
@@ -802,12 +858,7 @@ def main() -> None:
     if not image_path.exists():
         raise FileNotFoundError(f"Input image does not exist: {image_path}")
 
-    if args.fov is None:
-        fov, source = estimate_fov_from_exif(str(image_path))
-        print(f"Using horizontal FOV {fov:.2f} degrees ({source}).")
-    else:
-        fov = float(args.fov)
-
+    fov, _source = estimate_fov_from_exif(str(image_path))
     output_dir = args.output_dir or str(image_path.parent)
     checkpoint = _resolve_checkpoint(args.checkpoint)
     if not checkpoint.exists():
@@ -817,7 +868,14 @@ def main() -> None:
     model_cfg = _normalize_model_cfg(str(args.model_cfg))
     print(f"Loading SAM2 model on {device}: {checkpoint}")
     predictor = build_image_predictor(model_cfg, checkpoint, device)
-    SAM2ROIAnnotationGUI(str(image_path), fov, output_dir, predictor, device).run()
+    SAM2ROIAnnotationGUI(
+        str(image_path),
+        fov,
+        output_dir,
+        predictor,
+        device,
+        start_with_setup=True,
+    ).run()
 
 
 if __name__ == "__main__":
