@@ -11,7 +11,9 @@ import numpy as np
 import torch
 import torch.utils.data as Data
 from PIL import Image, ImageDraw
-from yacs.config import CfgNode
+
+from annotation_gui.base import add_button_row, create_image_figure
+from annotation_gui.io import build_annotation_payload, write_annotation_json
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -26,7 +28,6 @@ if "MPLCONFIGDIR" not in os.environ:
     mpl_config_dir.mkdir(parents=True, exist_ok=True)
     os.environ["MPLCONFIGDIR"] = str(mpl_config_dir)
 
-from config.cfg import PATH_KEYS, resolve_path
 from MaDCoW.src import CameraConfig
 from MaDCoW.src.camera import Camera
 from network.dataset import Dataset
@@ -41,6 +42,7 @@ HIT_TOLERANCE_PX = 8.0
 DEFAULT_IMAGE = BASE_DIR / "data" / "test_1.jpg"
 DEFAULT_OUTPUT_DIR = BASE_DIR / "data"
 DEFAULT_SELECTION_CONFIG = BASE_DIR / "config" / "line_selection.json"
+DEFAULT_FOCAL_LENGTH_MM = 13.0
 DEFAULT_SENSOR_WIDTH_MM = 36.0
 
 CAMERA_MODEL_CHOICES = ("pinhole", "360")
@@ -48,7 +50,6 @@ CAMERA_MODEL_LABELS = {
     "pinhole": "Pinhole",
     "360": "360",
 }
-CAMERA_MODEL_FROM_LABEL = {label: model for model, label in CAMERA_MODEL_LABELS.items()}
 MODEL_BY_CAMERA = {
     "pinhole": "pinhole.pkl",
     "360": "spherical.pkl",
@@ -79,12 +80,6 @@ def parse_args():
     )
     parser.add_argument("--image", default=str(DEFAULT_IMAGE), help="Input image path.")
     parser.add_argument(
-        "--camera-model",
-        choices=CAMERA_MODEL_CHOICES,
-        default="360",
-        help="Input image camera model.",
-    )
-    parser.add_argument(
         "--model_name",
         "--model-name",
         dest="model_name",
@@ -106,23 +101,6 @@ def parse_args():
     parser.add_argument("--junc_score_thresh", "--junc-score-thresh", dest="junc_score_thresh", type=float, default=None)
     parser.add_argument("--line_score_thresh", "--line-score-thresh", dest="line_score_thresh", type=float, default=None)
 
-    parser.add_argument("--focal_length_mm", "--focal-length-mm", dest="focal_length_mm", type=float, default=13.0)
-    parser.add_argument(
-        "--sensor_width_mm",
-        "--sensor-width-mm",
-        dest="sensor_width_mm",
-        type=float,
-        default=DEFAULT_SENSOR_WIDTH_MM,
-        help="Sensor width used to convert focal length to horizontal FOV.",
-    )
-    parser.add_argument(
-        "--fov_deg",
-        "--fov-deg",
-        dest="fov_deg",
-        type=float,
-        default=None,
-        help="Override pinhole FOV directly. Ignored for 360 output annotations.",
-    )
     parser.add_argument("--num_workers", "--num-workers", dest="num_workers", type=int, default=0)
     return parser.parse_args()
 
@@ -236,10 +214,8 @@ def horizontal_fov_deg(focal_length_mm: float, sensor_width_mm: float) -> float:
     return math.degrees(2.0 * math.atan(sensor_width_mm / (2.0 * focal_length_mm)))
 
 
-def resolve_pinhole_fov(args: argparse.Namespace) -> float:
-    fov_deg = args.fov_deg
-    if fov_deg is None:
-        fov_deg = horizontal_fov_deg(args.focal_length_mm, args.sensor_width_mm)
+def resolve_pinhole_fov() -> float:
+    fov_deg = horizontal_fov_deg(DEFAULT_FOCAL_LENGTH_MM, DEFAULT_SENSOR_WIDTH_MM)
     if not 0.0 < fov_deg < 180.0:
         raise ValueError(f"fov_deg must be in (0, 180); got {fov_deg}.")
     return float(fov_deg)
@@ -252,9 +228,10 @@ def model_name_for_camera(camera_model: str, model_override: str = "") -> str:
 
 
 def load_cfg(args: argparse.Namespace, model_name: str, selection: SelectionConfig):
-    config_path = Path(args.config_path)
-    if not config_path.is_absolute():
-        config_path = BASE_DIR / config_path
+    from config.cfg import PATH_KEYS, resolve_path
+    from yacs.config import CfgNode
+
+    config_path = _resolve_existing_or_base(args.config_path, BASE_DIR)
     yaml_file = config_path / args.config_file
 
     with open(yaml_file, "r", encoding="utf-8") as f:
@@ -421,9 +398,9 @@ class AutoLineReviewGUI:
         self.json_path.parent.mkdir(parents=True, exist_ok=True)
         self.marked_image_path.parent.mkdir(parents=True, exist_ok=True)
 
-        self.camera_model = _normalize_camera_model(args.camera_model)
+        self.camera_model = _normalize_camera_model("360")
         self.detected_camera_model = self.camera_model
-        self.pinhole_fov_deg = resolve_pinhole_fov(args)
+        self.pinhole_fov_deg = resolve_pinhole_fov()
         self.selection_config_path = Path(args.selection_config)
         self.score_override = args.score_thresh
         self.top_k_override = args.top_k
@@ -466,34 +443,18 @@ class AutoLineReviewGUI:
         plt.show()
 
     def _build_figure(self) -> None:
-        import matplotlib.pyplot as plt
-        from matplotlib.widgets import Button, RadioButtons
-
-        self.fig, self.ax = plt.subplots(figsize=(12, 8))
-        self.fig.canvas.manager.set_window_title("ULSD Line Review Tool")
-        self.fig.subplots_adjust(left=0.03, right=0.99, bottom=0.23, top=0.93)
-        self.ax.imshow(self.preview_image)
+        self.fig, self.ax, self.image_artist, self.status, self.help_text = create_image_figure(
+            "ULSD Line Review Tool",
+            self.preview_image,
+        )
         self.ax.set_xlim(-0.5, self.preview_width - 0.5)
         self.ax.set_ylim(self.preview_height - 0.5, -0.5)
-        self.ax.set_aspect("equal")
-        self.ax.set_xticks([])
-        self.ax.set_yticks([])
-        self.status = self.fig.text(0.03, 0.965, "", ha="left", va="center", fontsize=10)
+        self.help_text.set_text("Review auto candidates or draw additional lines; saved coordinates use original image space.")
 
         self.widgets: list[Any] = []
-
-        def add_centered_button_row(buttons: list[tuple[str, float, Any]], y0: float) -> None:
-            gap = 0.018
-            total_width = sum(width for _label, width, _callback in buttons) + gap * (len(buttons) - 1)
-            x0 = (1.0 - total_width) * 0.5
-            for label, width, callback in buttons:
-                ax_button = self.fig.add_axes([x0, y0, width, 0.045])
-                button = Button(ax_button, label)
-                button.on_clicked(callback)
-                self.widgets.append(button)
-                x0 += width + gap
-
-        add_centered_button_row(
+        add_button_row(
+            self.fig,
+            self.widgets,
             [
                 ("Review", 0.085, self._button_review),
                 ("Draw", 0.075, self._button_draw),
@@ -504,7 +465,9 @@ class AutoLineReviewGUI:
             ],
             0.045,
         )
-        add_centered_button_row(
+        add_button_row(
+            self.fig,
+            self.widgets,
             [
                 ("Undo", 0.075, self._button_undo),
                 ("Save", 0.075, self._button_save),
@@ -512,13 +475,6 @@ class AutoLineReviewGUI:
             ],
             0.105,
         )
-
-        camera_ax = self.fig.add_axes([0.415, 0.158, 0.17, 0.06])
-        labels = [CAMERA_MODEL_LABELS[model] for model in CAMERA_MODEL_CHOICES]
-        active = CAMERA_MODEL_CHOICES.index(self.camera_model)
-        self.camera_selector = RadioButtons(camera_ax, labels, active=active)
-        self.camera_selector.on_clicked(self._on_camera_model_select)
-        self.widgets.append(self.camera_selector)
 
         self.fig.canvas.mpl_connect("button_press_event", self._on_click)
         self.fig.canvas.mpl_connect("motion_notify_event", self._on_draw)
@@ -708,15 +664,6 @@ class AutoLineReviewGUI:
             return
         self._refresh()
 
-    def _on_camera_model_select(self, label: str) -> None:
-        model = CAMERA_MODEL_FROM_LABEL[label]
-        if model == self.camera_model:
-            return
-        self.camera_model = model
-        self.needs_rerun = True
-        self.status_extra = f"Camera changed to {label}. Press Rerun before saving."
-        self._refresh()
-
     def _on_click(self, event: object) -> None:
         if getattr(event, "inaxes", None) is not self.ax:
             return
@@ -875,16 +822,15 @@ class AutoLineReviewGUI:
             self.status_extra = "Camera model changed. Press Rerun before saving."
             return False
 
-        payload: dict[str, object] = {
-            "image_path": _relative_path(self.image_path, self.json_path.parent),
-            "camera_model": self.camera_model,
-        }
-        if self.camera_model == "pinhole":
-            payload["fov_deg"] = self.pinhole_fov_deg
-        payload["lines"] = self._line_json()
-        payload["regions"] = []
-
-        self.json_path.write_text(json.dumps(payload, indent=4), encoding="utf-8")
+        payload = build_annotation_payload(
+            image_path=self.image_path,
+            output_path=self.json_path,
+            camera_model=self.camera_model,
+            fov_deg=self.pinhole_fov_deg if self.camera_model == "pinhole" else None,
+            lines=self._line_json(),
+            regions=[],
+        )
+        write_annotation_json(self.json_path, payload)
         self._write_selected_lines_image()
         self.status_extra = (
             f"Saved {len(payload['lines'])} lines to {self.json_path.name} "

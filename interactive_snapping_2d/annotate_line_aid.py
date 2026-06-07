@@ -12,6 +12,9 @@ from typing import Any
 import numpy as np
 from PIL import ExifTags, Image
 
+from annotation_gui import AnnotationSession, render_centered_equirectangular
+from annotation_gui.base import add_button_row, add_text_box, clear_widget_axes, create_image_figure, set_image_artist
+
 from .snap2d import SnapConfig, SnapResult, load_snap_config, snap_annotation
 from .snap2d.io import save_madcow_annotation_json
 
@@ -24,6 +27,7 @@ CAMERA_TYPE_CHOICES = ("pinhole", "panorama")
 SNAP_MODE_CHOICES = ("line", "curve")
 
 STATE_CAMERA_SELECT = "camera_select"
+STATE_PINHOLE_SETUP = "pinhole_setup"
 STATE_PANORAMA_SETUP = "panorama_setup"
 STATE_ANNOTATE = "annotate"
 
@@ -241,37 +245,6 @@ def _remap_panorama_preview(
     )
 
 
-def _center_figure_window(fig: Any) -> None:
-    """Center the Matplotlib figure window when the active backend exposes window geometry."""
-    manager = getattr(getattr(fig, "canvas", None), "manager", None)
-    window = getattr(manager, "window", None)
-    if window is None:
-        return
-
-    try:
-        if hasattr(window, "wm_geometry"):
-            window.update_idletasks()
-            width = int(window.winfo_width())
-            height = int(window.winfo_height())
-            screen_width = int(window.winfo_screenwidth())
-            screen_height = int(window.winfo_screenheight())
-            x = max(0, (screen_width - width) // 2)
-            y = max(0, (screen_height - height) // 2)
-            window.wm_geometry(f"+{x}+{y}")
-            return
-
-        if hasattr(window, "frameGeometry") and hasattr(window, "move"):
-            frame = window.frameGeometry()
-            screen = window.screen() if hasattr(window, "screen") else None
-            available = screen.availableGeometry() if screen is not None else None
-            if available is None:
-                return
-            frame.moveCenter(available.center())
-            window.move(frame.topLeft())
-    except Exception:
-        return
-
-
 @dataclass
 class AnnotationItem:
     """One annotation stored by the GUI."""
@@ -301,27 +274,20 @@ class LineAidAnnotationGUI:
         self.fov_deg = None if fov_deg is None else float(fov_deg)
         if self.fov_deg is not None and (self.fov_deg <= 0 or self.fov_deg >= 180):
             raise ValueError(f"fov_deg must lie in (0, 180); got {self.fov_deg}.")
+        self.default_fov_deg = float(self.fov_deg if self.fov_deg is not None else FALLBACK_FOV_DEG)
         self.snap_config = snap_config or SnapConfig()
 
         self.output_dir = Path(output_dir).resolve()
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
-        with Image.open(self.image_path) as img:
-            original_image = img.convert("RGB")
-            self.original_width, self.original_height = original_image.size
-            preview_size = _compute_preview_size(self.original_width, self.original_height, PREVIEW_MAX_SIDE)
-            preview_image = (
-                original_image
-                if preview_size == original_image.size
-                else original_image.resize(preview_size, _lanczos_resampling())
-            )
-            self.original_image = np.array(original_image)
-            self.preview_image = np.array(preview_image)
-
-        self.preview_height, self.preview_width = self.preview_image.shape[:2]
-        self.is_downsampled = (
-            self.preview_width != self.original_width or self.preview_height != self.original_height
-        )
+        self.session = AnnotationSession.from_image(self.image_path, PREVIEW_MAX_SIDE, self.fov_deg)
+        self.original_image = self.session.source_view.image
+        self.preview_image = self.session.source_view.preview
+        self.original_width = self.session.source_view.width
+        self.original_height = self.session.source_view.height
+        self.preview_width = self.session.source_view.preview_width
+        self.preview_height = self.session.source_view.preview_height
+        self.is_downsampled = self.session.source_view.is_downsampled
         self.state = STATE_CAMERA_SELECT
         self.snap_mode = "line"
         self.annotations: list[AnnotationItem] = []
@@ -340,6 +306,7 @@ class LineAidAnnotationGUI:
         self.panorama_setup_image: np.ndarray | None = None
         self.panorama_crop_box = self._default_crop_box()
         self.annotation_image: np.ndarray | None = None
+        self.annotation_original_image: np.ndarray | None = None
         self.annotation_setup_image: np.ndarray | None = None
         self.annotation_center_lam = 0.0
         self.annotation_center_phi = 0.0
@@ -360,63 +327,40 @@ class LineAidAnnotationGUI:
 
     def _build_figure(self) -> None:
         """Create the figure, controls, and event callbacks."""
-        import matplotlib.pyplot as plt
-
-        self.fig, self.ax = plt.subplots(figsize=(12, 8))
-        self.fig.canvas.manager.set_window_title("2D Interactive Snapping Annotation")
-        self.fig.subplots_adjust(left=0.03, right=0.99, bottom=0.18, top=0.92)
         self.blank_image = np.full((max(1, self.preview_height), max(1, self.preview_width), 3), 245, dtype=np.uint8)
-        self.image_artist = self.ax.imshow(self.blank_image)
-        self.ax.set_aspect("equal")
-        self.ax.set_xticks([])
-        self.ax.set_yticks([])
-        self.status = self.fig.text(0.03, 0.955, "", ha="left", va="center", fontsize=10)
-        self.help_text = self.fig.text(0.03, 0.925, "", ha="left", va="center", fontsize=9)
+        self.fig, self.ax, self.image_artist, self.status, self.help_text = create_image_figure(
+            "2D Interactive Snapping Annotation",
+            self.blank_image,
+        )
 
         self.widgets: list[Any] = []
         self._buttons: dict[str, Any] = {}
         self.mode_radio: Any | None = None
+        self.fov_box: Any | None = None
+        self._syncing_fov_box = False
 
         self.fig.canvas.mpl_connect("button_press_event", self._on_click)
         self.fig.canvas.mpl_connect("motion_notify_event", self._on_motion)
         self.fig.canvas.mpl_connect("button_release_event", self._on_release)
         self.fig.canvas.mpl_connect("key_press_event", self._on_key)
-        _center_figure_window(self.fig)
 
     def _clear_controls(self) -> None:
         """Remove all current-state controls from the figure."""
-        seen_axes: set[int] = set()
-        for widget in list(self.widgets):
-            ax = getattr(widget, "ax", None)
-            if ax is None:
-                continue
-            ax_id = id(ax)
-            if ax_id in seen_axes:
-                continue
-            seen_axes.add(ax_id)
-            try:
-                ax.remove()
-            except ValueError:
-                pass
-        self.widgets.clear()
+        clear_widget_axes(self.widgets)
         self._buttons.clear()
         self.mode_radio = None
+        self.fov_box = None
 
     def _set_controls(self, button_specs: list[tuple[str, str, float, float, float, Any]]) -> None:
         """Create only the buttons that are valid for the current GUI state."""
-        from matplotlib.widgets import Button
-
         self._clear_controls()
         for key, label, x0, y0, width, callback in button_specs:
-            button_ax = self.fig.add_axes([x0, y0, width, 0.055])
-            button = Button(button_ax, label)
-            button.on_clicked(callback)
-            self.widgets.append(button)
+            button = add_button_row(self.fig, self.widgets, [(label, width, callback)], y0=y0, x0=x0)[0]
             self._buttons[key] = button
 
     def _set_annotation_controls(self) -> None:
         """Create annotation review controls for the active camera mode."""
-        from matplotlib.widgets import Button, RadioButtons
+        from matplotlib.widgets import RadioButtons
 
         self._clear_controls()
         mode_ax = self.fig.add_axes([0.04, 0.035, 0.14, 0.12])
@@ -427,17 +371,18 @@ class LineAidAnnotationGUI:
         self.widgets.append(self.mode_radio)
 
         button_specs = [
-            ("redraw", "Redraw", 0.24, 0.08, 0.09, self._button_redraw),
-            ("next", "Next", 0.35, 0.08, 0.09, self._button_next),
-            ("save", "Save", 0.46, 0.08, 0.09, self._button_save),
-            ("save_close", "Save + Close", 0.57, 0.08, 0.14, self._button_save_close),
-            ("reset", "Reset", 0.73, 0.08, 0.10, self._button_reset),
+            ("redraw", "Redraw", 0.09, self._button_redraw),
+            ("next", "Next", 0.09, self._button_next),
+            ("save", "Save", 0.09, self._button_save),
+            ("save_close", "Save+Close", 0.13, self._button_save_close),
         ]
-        for key, label, x0, y0, width, callback in button_specs:
-            button_ax = self.fig.add_axes([x0, y0, width, 0.055])
-            button = Button(button_ax, label)
-            button.on_clicked(callback)
-            self.widgets.append(button)
+        created = add_button_row(
+            self.fig,
+            self.widgets,
+            [(label, width, callback) for _key, label, width, callback in button_specs],
+            y0=0.08,
+        )
+        for (key, _label, _width, _callback), button in zip(button_specs, created):
             self._buttons[key] = button
 
     def _set_axes_visible(self, visible: bool) -> None:
@@ -446,12 +391,7 @@ class LineAidAnnotationGUI:
 
     def _set_image(self, image: np.ndarray) -> None:
         """Update the image artist and axes limits for a new image."""
-        arr = np.asarray(image)
-        height, width = arr.shape[:2]
-        self.image_artist.set_data(arr)
-        self.image_artist.set_extent((-0.5, width - 0.5, height - 0.5, -0.5))
-        self.ax.set_xlim(-0.5, width - 0.5)
-        self.ax.set_ylim(height - 0.5, -0.5)
+        set_image_artist(self.image_artist, self.ax, image)
 
     def _clear_dynamic_artists(self) -> None:
         """Remove dynamic overlay artists."""
@@ -490,6 +430,7 @@ class LineAidAnnotationGUI:
         self.panorama_setup_image = None
         self.panorama_crop_box = self._default_crop_box()
         self.annotation_image = None
+        self.annotation_original_image = None
         self.annotation_setup_image = None
         self.annotation_center_lam = 0.0
         self.annotation_center_phi = 0.0
@@ -502,19 +443,56 @@ class LineAidAnnotationGUI:
                 ("panorama", "Panorama", 0.53, 0.08, 0.14, self._button_choose_panorama),
             ]
         )
-        self._set_image(self.blank_image)
-        self._set_axes_visible(False)
+        self._set_image(self.preview_image)
+        self._set_axes_visible(True)
         self.status.set_text("Choose camera mode.")
-        self.help_text.set_text("Pinhole starts annotation directly. Panorama opens view setup first.")
+        self.help_text.set_text("Pinhole opens FOV setup. Panorama opens view/crop setup first.")
         self.fig.canvas.draw_idle()
 
     def _button_choose_pinhole(self, _event: object) -> None:
         """Enter pinhole line annotation."""
-        self._enter_annotation("pinhole")
+        self._enter_pinhole_setup()
 
     def _button_choose_panorama(self, _event: object) -> None:
         """Enter panorama view setup."""
         self._enter_panorama_setup()
+
+    def _enter_pinhole_setup(self) -> None:
+        """Show pinhole FOV setup before annotation starts."""
+        self.state = STATE_PINHOLE_SETUP
+        self.camera_type = "pinhole"
+        if self.fov_deg is None:
+            self.fov_deg = FALLBACK_FOV_DEG
+        self.pending = None
+        self.annotations.clear()
+        self.current_stroke = []
+        self._drawing_stroke = False
+        self._drag_action = None
+        self._clear_dynamic_artists()
+        self._clear_controls()
+        self._set_image(self.preview_image)
+        self._set_axes_visible(True)
+
+        self.fov_box = add_text_box(
+            self.fig,
+            self.widgets,
+            "FOV",
+            f"{self.fov_deg:.2f}",
+            self._on_fov_submit,
+            width=0.18,
+            y0=0.08,
+            x0=0.38,
+        )
+        self._buttons["done"] = add_button_row(
+            self.fig,
+            self.widgets,
+            [("Done", 0.10, self._button_done_pinhole)],
+            y0=0.08,
+            x0=0.60,
+        )[0]
+
+        self.status_extra = "Adjust pinhole horizontal FOV."
+        self._refresh()
 
     def _enter_panorama_setup(self) -> None:
         """Show panorama center and crop setup."""
@@ -530,9 +508,9 @@ class LineAidAnnotationGUI:
         self.panorama_crop_box = self._default_crop_box()
         self._set_controls(
             [
-                ("h_reset", "H Reset", 0.34, 0.08, 0.11, self._button_h_reset),
-                ("v_reset", "V Reset", 0.47, 0.08, 0.11, self._button_v_reset),
-                ("done", "Done", 0.60, 0.08, 0.10, self._button_done_setup),
+                ("h_reset", "H Reset", 0.32, 0.08, 0.11, self._button_h_reset),
+                ("v_reset", "V Reset", 0.45, 0.08, 0.11, self._button_v_reset),
+                ("done", "Done", 0.58, 0.08, 0.10, self._button_done_setup),
             ]
         )
         self._set_axes_visible(True)
@@ -540,11 +518,17 @@ class LineAidAnnotationGUI:
         self.status_extra = "Adjust panorama view center and crop range."
         self._refresh()
 
+    def _button_done_pinhole(self, _event: object) -> None:
+        """Finalize pinhole FOV setup and enter line annotation."""
+        if self.state == STATE_PINHOLE_SETUP:
+            self._enter_annotation("pinhole")
+
     def _enter_annotation(self, camera_type: str) -> None:
         """Enter line annotation for the selected camera type."""
         self.state = STATE_ANNOTATE
-        self.camera_type = _normalize_camera_type(camera_type)
-        if self.camera_type == "pinhole" and self.fov_deg is None:
+        selected_camera_type = _normalize_camera_type(camera_type)
+        self.camera_type = selected_camera_type
+        if selected_camera_type == "pinhole" and self.fov_deg is None:
             self.fov_deg = FALLBACK_FOV_DEG
         self.current_stroke = []
         self.pending = None
@@ -552,17 +536,50 @@ class LineAidAnnotationGUI:
         self._drag_action = None
         self._set_annotation_controls()
         self._set_axes_visible(True)
-        if self.camera_type == "panorama":
+        if selected_camera_type == "panorama":
             self._build_panorama_annotation_image()
+            self.camera_type = self.session.camera_model
         else:
-            self.annotation_image = self.preview_image
+            self.session.use_pinhole_source(float(self.fov_deg))
+            self.annotation_original_image = self.session.image
+            self.annotation_image = self.session.preview
             self.annotation_setup_image = None
             self.annotation_center_lam = 0.0
             self.annotation_center_phi = 0.0
-            self.annotation_crop_box = (0.0, 0.0, float(self.preview_width), float(self.preview_height))
+            self.annotation_crop_box = (0.0, 0.0, float(self.original_width), float(self.original_height))
             self.annotation_crop_origin = (0.0, 0.0)
+        self.fov_deg = self.session.fov_deg
         self.status_extra = "Draw a rough stroke. Then choose Redraw or Next."
         self._refresh()
+
+    def _set_fov_value(self, value: float) -> bool:
+        """Validate and store the pinhole FOV value."""
+        if not math.isfinite(value) or value <= 0.0 or value >= 180.0:
+            self.status_extra = "FOV must be in (0, 180) degrees."
+            self._refresh()
+            return False
+        self.fov_deg = float(value)
+        if self.fov_box is not None:
+            self._syncing_fov_box = True
+            try:
+                self.fov_box.set_val(f"{self.fov_deg:.2f}")
+            finally:
+                self._syncing_fov_box = False
+        self.status_extra = "Pinhole FOV updated."
+        self._refresh()
+        return True
+
+    def _on_fov_submit(self, text: str) -> None:
+        """Apply a FOV typed into the setup text box."""
+        if self._syncing_fov_box:
+            return
+        try:
+            value = float(text)
+        except ValueError:
+            self.status_extra = "FOV must be numeric."
+            self._refresh()
+            return
+        self._set_fov_value(value)
 
     def _button_done_setup(self, _event: object) -> None:
         """Finalize panorama setup and enter line annotation."""
@@ -586,10 +603,6 @@ class LineAidAnnotationGUI:
         self._render_panorama_setup_image()
         self.status_extra = "Vertical view center reset."
         self._refresh()
-
-    def _button_reset(self, _event: object) -> None:
-        """Discard state and return to camera selection."""
-        self._show_camera_select()
 
     def _on_snap_mode_changed(self, label: str) -> None:
         """Set the annotation type and resnap the pending stroke if present."""
@@ -646,8 +659,15 @@ class LineAidAnnotationGUI:
                 self._button_next(event)
             elif key in ("s", "ctrl+s", "cmd+s"):
                 self._button_save(event)
-        elif self.state == STATE_PANORAMA_SETUP:
+        elif self.state == STATE_PINHOLE_SETUP:
             if key in ("enter", " "):
+                self._button_done_pinhole(event)
+        elif self.state == STATE_PANORAMA_SETUP:
+            if key in ("h",):
+                self._button_h_reset(event)
+            elif key in ("v",):
+                self._button_v_reset(event)
+            elif key in ("enter", " "):
                 self._button_done_setup(event)
 
     def _clip_setup_xy(self, x: float, y: float) -> tuple[float, float]:
@@ -661,15 +681,21 @@ class LineAidAnnotationGUI:
         return float(np.clip(x, 0.0, width - 1.0)), float(np.clip(y, 0.0, height - 1.0))
 
     def _require_annotation_image(self) -> np.ndarray:
-        """Return the active annotation image."""
+        """Return the active annotation preview image."""
         if self.annotation_image is None:
             raise RuntimeError("Annotation image is not initialized.")
         return self.annotation_image
 
+    def _require_annotation_original_image(self) -> np.ndarray:
+        """Return the active original-resolution annotation image."""
+        if self.annotation_original_image is None:
+            raise RuntimeError("Original-resolution annotation image is not initialized.")
+        return self.annotation_original_image
+
     def _render_panorama_setup_image(self) -> None:
         """Render the full preview panorama for the current center."""
-        self.panorama_setup_image = _remap_panorama_preview(
-            self.preview_image,
+        self.panorama_setup_image = render_centered_equirectangular(
+            self.session.source_view.preview,
             self.panorama_center_lam,
             self.panorama_center_phi,
             self.preview_width,
@@ -677,19 +703,25 @@ class LineAidAnnotationGUI:
         )
 
     def _build_panorama_annotation_image(self) -> None:
-        """Crop the selected panorama setup view for annotation."""
-        if self.panorama_setup_image is None:
-            self._render_panorama_setup_image()
-        if self.panorama_setup_image is None:
-            raise RuntimeError("Panorama setup image is not initialized.")
+        """Render the selected original-resolution panorama view for annotation."""
         crop_box = self._normalized_crop_box()
+        self.session.use_panorama_view(
+            self.output_dir,
+            self.panorama_center_lam,
+            self.panorama_center_phi,
+            crop_box,
+            PREVIEW_MAX_SIDE,
+        )
+        if self.session.panorama_result is None:
+            raise RuntimeError("Panorama annotation view was not created.")
         self.annotation_center_lam = self.panorama_center_lam
         self.annotation_center_phi = self.panorama_center_phi
-        self.annotation_crop_box = crop_box
-        self.annotation_setup_image = self.panorama_setup_image.copy()
-        ix0, iy0, ix1, iy1 = self._crop_indices_from_box(crop_box)
-        self.annotation_crop_origin = (float(ix0), float(iy0))
-        self.annotation_image = self.annotation_setup_image[iy0:iy1, ix0:ix1].copy()
+        self.annotation_crop_box = self.session.panorama_result.crop_original_px
+        self.annotation_setup_image = None
+        self.annotation_crop_origin = (0.0, 0.0)
+        self.annotation_original_image = self.session.image
+        self.annotation_image = self.session.preview
+        self.fov_deg = self.session.fov_deg
 
     def _crop_indices_from_box(self, crop_box: tuple[float, float, float, float]) -> tuple[int, int, int, int]:
         """Convert a setup crop box to array slice indices using pixel-center inclusion."""
@@ -784,58 +816,19 @@ class LineAidAnnotationGUI:
         self._render_panorama_setup_image()
 
     def _annotation_points_to_original(self, points: np.ndarray) -> np.ndarray:
-        """Map annotation-image coordinates to original-image coordinates."""
+        """Map annotation-preview coordinates to active original image coordinates."""
         arr = np.asarray(points, dtype=np.float64)
         if arr.ndim != 2 or arr.shape[1] != 2:
             raise ValueError(f"points must have shape (N, 2); got {arr.shape}.")
-        if self.camera_type == "panorama":
-            crop_x, crop_y = self.annotation_crop_origin
-            setup_x = arr[:, 0] + crop_x
-            setup_y = arr[:, 1] + crop_y
-            local_lam, local_phi = _equirect_pixel_to_angles(
-                setup_x,
-                setup_y,
-                self.preview_width,
-                self.preview_height,
-            )
-            world_lam, world_phi = _local_to_world_angles(
-                local_lam,
-                local_phi,
-                self.annotation_center_lam,
-                self.annotation_center_phi,
-            )
-            x, y = _angles_to_equirect_pixel(world_lam, world_phi, self.original_width, self.original_height)
-        else:
-            x = (arr[:, 0] + 0.5) * (self.original_width / self.preview_width) - 0.5
-            y = (arr[:, 1] + 0.5) * (self.original_height / self.preview_height) - 0.5
-        out = np.column_stack((x, y)).astype(np.float32)
-        out[:, 0] = np.mod(out[:, 0], float(self.original_width)) if self.camera_type == "panorama" else np.clip(
-            out[:, 0],
-            0.0,
-            float(self.original_width - 1),
+        return np.asarray(
+            [self.session.active_view.preview_to_image_xy(float(x), float(y)) for x, y in arr],
+            dtype=np.float32,
         )
-        out[:, 1] = np.clip(out[:, 1], 0.0, float(self.original_height - 1))
-        return out
 
     def _original_points_to_annotation(self, points: np.ndarray) -> np.ndarray:
-        """Map original-image coordinates to active annotation-image coordinates."""
+        """Map active original image coordinates to annotation-preview coordinates."""
         arr = np.asarray(points, dtype=np.float64)
-        if self.camera_type == "panorama":
-            lam, phi = _equirect_pixel_to_angles(arr[:, 0], arr[:, 1], self.original_width, self.original_height)
-            local_lam, local_phi = _world_to_local_angles(
-                lam,
-                phi,
-                self.annotation_center_lam,
-                self.annotation_center_phi,
-            )
-            setup_x, setup_y = _angles_to_equirect_pixel(local_lam, local_phi, self.preview_width, self.preview_height)
-            crop_x, crop_y = self.annotation_crop_origin
-            x = setup_x - crop_x
-            y = setup_y - crop_y
-        else:
-            x = (arr[:, 0] + 0.5) * (self.preview_width / self.original_width) - 0.5
-            y = (arr[:, 1] + 0.5) * (self.preview_height / self.original_height) - 0.5
-        return np.column_stack((x, y)).astype(np.float32)
+        return self.session.active_view.image_to_preview_points(arr)
 
     def _on_click(self, event: object) -> None:
         """Handle mouse press by state."""
@@ -927,24 +920,29 @@ class LineAidAnnotationGUI:
         self._set_pending_from_annotation_stroke(stroke)
 
     def _set_pending_from_annotation_stroke(self, stroke: np.ndarray) -> None:
-        """Run the 2D snapper on the annotation image and store a pending result."""
-        image = self._require_annotation_image()
+        """Run the 2D snapper on the original-resolution annotation image."""
+        image = self._require_annotation_original_image()
+        stroke_original = self._annotation_points_to_original(stroke)
         try:
             snapped = snap_annotation(
                 image,
-                stroke,
+                stroke_original,
                 camera_type="pinhole",
                 mode=self.snap_mode,
                 config=self.snap_config,
             )
-            result_points = self._annotation_points_to_original(snapped.points)
-            source_points = self._annotation_points_to_original(snapped.source_stroke)
+            result_points = snapped.points.astype(np.float32, copy=True)
+            source_points = snapped.source_stroke.astype(np.float32, copy=True)
+            preview_points = self._original_points_to_annotation(result_points)
+            source_preview_points = self._original_points_to_annotation(source_points)
             debug = dict(snapped.debug)
             debug.update(
                 {
                     "annotation_camera_type": self.camera_type,
-                    "annotation_points": snapped.points,
-                    "annotation_source_stroke": snapped.source_stroke,
+                    "annotation_points": preview_points,
+                    "annotation_source_stroke": source_preview_points,
+                    "annotation_original_points": result_points,
+                    "annotation_original_source_stroke": source_points,
                     "panorama_center_lam": self.annotation_center_lam,
                     "panorama_center_phi": self.annotation_center_phi,
                     "panorama_crop_box": self.annotation_crop_box,
@@ -960,8 +958,8 @@ class LineAidAnnotationGUI:
             )
             self.pending = AnnotationItem(
                 result=result,
-                preview_points=snapped.points.astype(np.float32, copy=True),
-                source_preview_points=snapped.source_stroke.astype(np.float32, copy=True),
+                preview_points=preview_points.astype(np.float32, copy=True),
+                source_preview_points=source_preview_points.astype(np.float32, copy=True),
                 source_original_points=source_points.astype(np.float32, copy=True),
                 camera_type=str(self.camera_type),
                 snap_mode=self.snap_mode,
@@ -1014,11 +1012,13 @@ class LineAidAnnotationGUI:
         try:
             save_madcow_annotation_json(
                 results,
-                self.image_path,
+                self.session.image_path,
                 str(self.json_path),
-                image_shape=(self.original_height, self.original_width),
+                image_shape=(self.session.height, self.session.width),
                 camera_type=str(self.camera_type),
                 fov_deg=self.fov_deg,
+                source_image_path=self.session.source_image_path if self.session.view_metadata is not None else None,
+                view_metadata=self.session.view_metadata,
             )
         except Exception as exc:
             madcow_status = f"MaDCoW JSON not written: {exc}"
@@ -1030,6 +1030,14 @@ class LineAidAnnotationGUI:
         """Redraw the current GUI state."""
         self._clear_dynamic_artists()
         if self.state == STATE_CAMERA_SELECT:
+            self.fig.canvas.draw_idle()
+            return
+
+        if self.state == STATE_PINHOLE_SETUP:
+            self._set_image(self.preview_image)
+            fov = float(self.fov_deg or FALLBACK_FOV_DEG)
+            self.status.set_text(f"Camera: pinhole | FOV: {fov:.2f} deg | {self.status_extra}")
+            self.help_text.set_text("Type horizontal FOV, then press Done.")
             self.fig.canvas.draw_idle()
             return
 
@@ -1101,15 +1109,17 @@ class LineAidAnnotationGUI:
             self._dynamic_artists.append(stroke_artist)
 
         fov_text = f", fov={self.fov_deg:.2f}" if self.camera_type == "pinhole" and self.fov_deg is not None else ""
-        size_text = f"preview {self.preview_width}x{self.preview_height}"
+        size_text = f"source preview {self.preview_width}x{self.preview_height}"
         if self.is_downsampled:
-            size_text += f", original {self.original_width}x{self.original_height}"
+            size_text += f", source original {self.original_width}x{self.original_height}"
         image_h, image_w = image.shape[:2]
+        original_h, original_w = self._require_annotation_original_image().shape[:2]
         pending_text = "yes" if self.pending is not None else "no"
         self.status.set_text(
             f"Camera: {self.camera_type}{fov_text} | Type: {self.snap_mode} | "
             f"Accepted: {len(self.annotations)} | Pending: {pending_text} | "
-            f"annotation {image_w}x{image_h} | {size_text} | {self.status_extra}"
+            f"annotation preview {image_w}x{image_h}, original {original_w}x{original_h} | "
+            f"{size_text} | {self.status_extra}"
         )
         self.help_text.set_text(
             "Left-drag: draw rough stroke | Red: pending snapped result | Green: accepted annotations"
@@ -1157,18 +1167,6 @@ def parse_args() -> argparse.Namespace:
         help=f"Path to the input image. Defaults to {DEFAULT_IMAGE}.",
     )
     parser.add_argument(
-        "--fov",
-        type=float,
-        default=None,
-        help="Horizontal FOV in degrees for pinhole images. If omitted, EXIF is used when possible.",
-    )
-    parser.add_argument(
-        "--camera-type",
-        choices=("pinhole", "panorama", "360"),
-        default="pinhole",
-        help="Initial camera type hint. The GUI still starts at camera selection.",
-    )
-    parser.add_argument(
         "--output-dir",
         default=None,
         help="Where to save the MaDCoW annotation JSON. Defaults to the input image directory.",
@@ -1188,15 +1186,10 @@ def main() -> None:
     if not image_path.exists():
         raise FileNotFoundError(f"Input image does not exist: {image_path}")
 
-    camera_type = _normalize_camera_type(args.camera_type)
-    if args.fov is None:
-        fov, source = estimate_fov_from_exif(str(image_path))
-        print(f"Using horizontal FOV {fov:.2f} degrees ({source}) if pinhole mode is selected.")
-    else:
-        fov = args.fov
+    fov, _source = estimate_fov_from_exif(str(image_path))
     output_dir = args.output_dir or str(image_path.parent)
     snap_config = load_snap_config(args.config_json)
-    LineAidAnnotationGUI(str(image_path), fov, output_dir, camera_type=camera_type, snap_config=snap_config).run()
+    LineAidAnnotationGUI(str(image_path), fov, output_dir, snap_config=snap_config).run()
 
 
 if __name__ == "__main__":
