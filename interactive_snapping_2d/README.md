@@ -54,30 +54,41 @@ points_xy = result.points
 
 ```bash
 ./.venv/bin/python -m interactive_snapping_2d.annotate_line_aid \
-    --image interactive_snapping_2d/data/test_1.jpg \
+    --image <input-image> \
+    --output-dir <annotation-output-dir> \
     --config-json interactive_snapping_2d/config/snap_config.json
 ```
 
+`--config-json` is optional. When omitted, the tool uses
+`interactive_snapping_2d/config/snap_config.json`.
+
+The GUI starts with camera/view setup:
+
+- `Pinhole`: edit horizontal FOV if needed, then press `Done`.
+- `Panorama`: drag image content to choose view center, drag crop edges to
+  choose the annotation view, then press `Done`. The saved MaDCoW JSON uses
+  `camera_model: "panorama_view"` and includes `source_image_path` plus `view`
+  metadata.
+
 Mouse and keyboard controls:
 
-- `Camera`: choose `pinhole` or `panorama`.
 - `Type`: choose `line` or `curve`.
 - Left drag: draw a rough stroke; mouse release snaps it with the selected
-  camera and mode.
+  active view and mode.
 - `Redraw`: discard the pending snapped result and draw again.
 - `Next`: accept the pending snapped result and start the next annotation.
 - `Save`: accept any pending result, then save a MaDCoW-compatible annotation
   JSON.
-- `Save + Close`: save the annotation JSON and close the GUI after a successful
+- `Save+Close`: save the annotation JSON and close the GUI after a successful
   save.
 - `R` or `ESC`: discard the pending result or current stroke.
 - `N`, `Enter`, or `Space`: accept the pending snapped result.
 - `S`, `Ctrl+S`, or `Cmd+S`: save.
 
 The default MaDCoW annotation is compatible with `MaDCoW/main.py`: it contains
-`image_path`, `camera_model`, pinhole `fov_deg`, `lines[].points_dir` with 128
-view-sphere samples, and an empty `regions` list. Use one camera type per saved
-MaDCoW file; the MaDCoW export uses the current global `Camera` setting.
+`image_path`, `camera_model`, pinhole `fov_deg` when applicable,
+`lines[].points_dir` with 128 view-sphere samples, and an empty `regions`
+list. Use one camera setup per saved MaDCoW file.
 
 ## Snap Parameters
 
@@ -108,8 +119,9 @@ annotations to the current `main.py` schema:
 
 ```json
 {
-  "image_path": "../data/test_1.jpg",
-  "camera_model": "360",
+  "image_path": "input.jpg",
+  "camera_model": "pinhole",
+  "fov_deg": 90.0,
   "lines": [
     {
       "points_dir": [[-3.02, -1.45], "... 126 more samples ..."]
@@ -118,6 +130,9 @@ annotations to the current `main.py` schema:
   "regions": []
 }
 ```
+
+Panorama setup writes a derived annotation view and adds `source_image_path`,
+`schema_version: 2`, and `view` metadata.
 
 ## Known Limitations
 

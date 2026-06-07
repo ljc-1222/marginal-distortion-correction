@@ -6,14 +6,39 @@ Arbitrary Objects* (Zhang et al., CVPR 2025).
 
 The implementation corrects marginal distortion by optimizing a nonlinear mesh
 warp over the input camera's angular domain. Users provide straight-line
-constraints and region-of-interest (ROI) masks, the pipeline fits one local
-projection per ROI, blends those projections with a stereographic
+constraints and optional region-of-interest (ROI) masks. The pipeline fits one
+local projection per ROI, blends those projections with a stereographic
 initialization, then optimizes the full image warp with differentiable losses.
+
+## Paper and Citation
+
+MaDCoW addresses marginal distortion in wide-angle images, especially distorted
+object appearance near image borders. The original paper formulates the task as
+an annotation-guided warp: users mark straight lines and regions of interest,
+then the method estimates local perspective-like projections and solves a
+global warp that balances straight-line preservation, conformality,
+smoothness, and ROI projection consistency.
+
+- Paper: [MaDCoW: Marginal Distortion Correction for Wide-Angle Photography
+  with Arbitrary Objects](https://openaccess.thecvf.com/content/CVPR2025/html/Zhang_MaDCoW_Marginal_Distortion_Correction_for_Wide-Angle_Photography_with_Arbitrary_Objects_CVPR_2025_paper.html)
+- Venue: CVPR 2025
+
+```bibtex
+@InProceedings{Zhang_2025_CVPR,
+    author = {Zhang, Kevin and Huang, Jia-Bin and Echevarria, Jose and DiVerdi, Stephen and Hertzmann, Aaron},
+    title = {MaDCoW: Marginal Distortion Correction for Wide-Angle Photography with Arbitrary Objects},
+    booktitle = {Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR)},
+    month = {June},
+    year = {2025},
+    pages = {10923-10932}
+}
+```
 
 ## Current Pipeline
 
 1. Load the input image, annotation JSON, and pipeline config.
-2. Build the input camera from the annotation's `camera_model`.
+2. Build the input camera from the annotation's `camera_model` and optional
+   view metadata.
 3. Build the mesh from the input camera rays by sampling the image border and
    covering the resulting `(lambda, phi)` domain.
 4. Rasterize each ROI mask from input-image pixels onto the angular mesh.
@@ -29,11 +54,12 @@ initialization, then optimizes the full image warp with differentiable losses.
 ## Repository Layout
 
 - `main.py` - command-line entry point for the correction pipeline.
-- `annotate.py` - Matplotlib GUI for line and ROI annotation.
+- `annotate.py` - Matplotlib GUI for manual line and ROI annotation.
 - `config.json` - default mesh resolution, loss weights, and optimizer
   settings.
-- `data/` - sample image, annotation JSON files, and ROI mask PNGs.
-- `outputs/` - generated example outputs.
+- `data/` - optional local workspace for input images, annotation JSON files,
+  and ROI mask PNGs.
+- `outputs/` - optional local workspace for generated correction outputs.
 - `src/camera.py` - input camera models and pixel/ray conversion.
 - `src/mesh.py` - angular mesh construction, valid-domain masks, ROI mask
   rasterization, and mesh sampling.
@@ -47,54 +73,67 @@ initialization, then optimizes the full image warp with differentiable losses.
 
 ## Annotate an Image
 
+Use your own input image path. The command does not accept `--camera-model` or
+`--fov`; camera setup happens inside the GUI.
+
 ```bash
 ./.venv/bin/python -m MaDCoW.annotate \
-    --image MaDCoW/data/test_1.png \
-    --camera-model pinhole \
-    --fov 90 \
-    --output-dir MaDCoW/data
+    --image <input-image> \
+    --output-dir <annotation-output-dir>
 ```
 
-`--camera-model` must be either `pinhole` or `360`. The parser is strict:
-case variants and aliases are not accepted.
+The GUI first asks for the camera/view setup:
 
-For `pinhole`, `--fov` is the horizontal FOV of the input image in degrees. If
-it is omitted, the tool tries to estimate it from EXIF metadata and falls back
-to 90 degrees.
+- `Pinhole`: use the original image as a pinhole image. The tool estimates
+  horizontal FOV from EXIF when possible, falls back to 90 degrees, and lets the
+  user edit the FOV text box before pressing `Done`.
+- `Panorama`: treat the original image as a 360x180 equirectangular source,
+  choose a centered/cropped annotation view, then press `Done`. The tool writes
+  a derived view image into the output directory and saves
+  `camera_model: "panorama_view"` with `source_image_path` and `view` metadata.
 
-For `360`, the input is treated as a full 360x180 equirectangular image. `--fov`
-is ignored, and the saved annotation does not contain `fov_deg`.
+After camera setup, annotation is split into two phases:
 
-The GUI also has camera radio buttons for `Pinhole` and `360`. The GUI writes
-`<image_stem>.json` and one `mask_<roi>.png` file per non-empty ROI into the
-output directory.
-
-Useful GUI controls:
-
-- `l` or the `Line` button: switch to straight-line mode.
-- Left-drag in line mode along an input-image curve corresponding to a
+- ROI phase: left-drag paints the current ROI mask.
+- `Redraw`: clear the current ROI draft.
+- `Next ROI` or `n` / `Tab`: accept the current non-empty ROI and start the
+  next ROI draft.
+- `Brush -` / `Brush +` or `-` / `+`: adjust brush radius.
+- `Done ROI` or `d` / `Enter`: lock ROI masks and switch to line annotation.
+- Line phase: left-drag along an input-image curve corresponding to a
   real-world straight structure. The stroke is resampled to 128 view-sphere
   points and saved as `points_dir`.
-- `r` or the `Region` button: switch to ROI painting mode.
-- Left drag in region mode: paint the selected ROI.
-- Right drag in region mode: erase the selected ROI.
-- `n`: create a new ROI.
-- `[` / `]`: switch ROI.
-- `+` / `-`: change brush radius.
-- `u`: undo the last line or mask stroke.
-- `c`: clear the selected ROI.
-- Camera radio buttons: choose `Pinhole` or `360` before saving.
-- `s` or `Save`: save JSON and masks.
+- `Redraw` or `r` / `Esc`: clear the pending ROI or line draft.
+- `Next` or `n` / `Enter` / `Space`: accept the pending line.
+- `Save` or `s` / `Ctrl+S` / `Cmd+S`: save JSON and masks.
+- `Save+Close`: save the annotation JSON and close the GUI after a successful
+  save.
+
+The GUI writes `<image_stem>.json` and one `mask_<roi>.png` file per non-empty
+ROI into the output directory.
 
 ## Run Correction
 
+If the annotation JSON already contains the correct `image_path`, no image
+argument is needed:
+
 ```bash
 ./.venv/bin/python -m MaDCoW.main \
-    --image MaDCoW/data/test_1.png \
-    --annotations MaDCoW/data/test_1.json \
+    --annotations <annotation-json> \
     --config MaDCoW/config.json \
-    --output MaDCoW/outputs/result_1.jpg \
+    --output <output-image> \
     --crop
+```
+
+For non-`panorama_view` annotations, `--image` can override the image path saved
+inside the annotation JSON:
+
+```bash
+./.venv/bin/python -m MaDCoW.main \
+    --image <input-image> \
+    --annotations <annotation-json> \
+    --config MaDCoW/config.json \
+    --output <output-image>
 ```
 
 `--crop` is optional. When enabled, the renderer returns a validity mask and
@@ -103,7 +142,7 @@ input aspect ratio. Because cropping uses the validity mask, legitimate black
 pixels in the input are not treated as borders.
 
 `main.py` does not provide a CLI flag for choosing the camera model. The camera
-model must already be present in the annotation JSON written by `annotate.py`.
+model must already be present in the annotation JSON.
 
 ## Annotation JSON
 
@@ -113,7 +152,7 @@ the input horizontal FOV:
 
 ```json
 {
-    "image_path": "test_1.png",
+    "image_path": "input.jpg",
     "camera_model": "pinhole",
     "fov_deg": 90.0,
     "lines": [
@@ -134,12 +173,41 @@ the input horizontal FOV:
 }
 ```
 
-For a 360 equirectangular input, the annotation omits `fov_deg`:
+A full equirectangular input can be provided by external tools or manually
+authored annotations using `camera_model: "360"`:
 
 ```json
 {
-    "image_path": "panorama.png",
+    "image_path": "panorama.jpg",
     "camera_model": "360",
+    "lines": [],
+    "regions": []
+}
+```
+
+The current `annotate.py` panorama setup writes a derived annotation view with
+v2 metadata:
+
+```json
+{
+    "image_path": "panorama_view.png",
+    "source_image_path": "panorama.jpg",
+    "camera_model": "panorama_view",
+    "schema_version": 2,
+    "view": {
+        "type": "panorama_view",
+        "source_camera_model": "360",
+        "projection": "equirectangular_crop",
+        "source_size": [4000, 2000],
+        "view_size": [2000, 1000],
+        "preview_size": [1200, 600],
+        "center_yaw_rad": 0.0,
+        "center_pitch_rad": 0.0,
+        "crop_original_px": [1000.0, 0.0, 3000.0, 2000.0],
+        "crop_preview_px": [300.0, 0.0, 900.0, 600.0],
+        "horizontal_fov_deg": 179.0,
+        "vertical_fov_deg": 179.0
+    },
     "lines": [],
     "regions": []
 }
@@ -151,8 +219,12 @@ annotated curve may appear curved in the input image, but it should represent
 a real-world straight structure. The output line loss forces the warped curve
 samples to become collinear.
 
-Annotations missing `camera_model` are rejected by `main.py`; the value is set
-only by `annotate.py`.
+Annotations missing `camera_model` are rejected by `main.py`. Supported camera
+models are `pinhole`, `360`, and `panorama_view`.
+
+For `panorama_view` annotations, `main.py` must run on the saved
+`image_path`. Passing `--image` with a different path is rejected to avoid
+mixing the derived view geometry with another image.
 
 ## Config
 
@@ -187,21 +259,24 @@ only by `annotate.py`.
 - `stage2_max_iter`: maximum L-BFGS iterations for the full warp.
 - `lbfgs_lr`: L-BFGS learning rate.
 
-The mesh extent is derived from the input camera rays; changing the config
-mesh values changes sampling density, not a separate output camera model.
+The mesh extent is derived from the input camera rays; changing the config mesh
+values changes sampling density, not a separate output camera model.
 
-## Example Data
+## Smoke Test With Your Own Files
 
-The included sample files can be used as quick smoke tests:
+Create or provide an annotation JSON for your own image, then run:
 
 ```bash
 ./.venv/bin/python -m MaDCoW.main \
-    --image MaDCoW/data/test_1.png \
-    --annotations MaDCoW/data/test_1.json \
+    --image <input-image> \
+    --annotations <annotation-json> \
     --config MaDCoW/config.json \
-    --output MaDCoW/outputs/result_1.jpg \
+    --output <output-image> \
     --crop
 ```
+
+For `panorama_view` annotations, omit `--image` unless it is exactly the same
+path as the annotation's `image_path`.
 
 ## Development Checks
 
