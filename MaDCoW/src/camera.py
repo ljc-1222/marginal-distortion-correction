@@ -29,10 +29,17 @@ import math
 
 import numpy as np
 
+from annotation_gui.panorama import (
+    angles_to_equirect_pixel,
+    equirect_pixel_to_angles,
+    local_to_world_angles,
+    world_to_local_angles,
+)
+
 from . import Array, CameraConfig
 
 
-_SUPPORTED_MODELS = {"pinhole", "360"}
+_SUPPORTED_MODELS = {"pinhole", "360", "panorama_view"}
 
 
 def _normalize_model(model: str) -> str:
@@ -214,6 +221,76 @@ class _EquirectangularCamera:
         )
 
 
+class _PanoramaViewCamera:
+    """Cropped centered equirectangular panorama view from v2 annotations."""
+
+    def __init__(self, cfg: CameraConfig) -> None:
+        """Initialize a panorama-derived crop camera from annotation metadata."""
+        if cfg.view is None:
+            raise ValueError("panorama_view camera requires annotation view metadata.")
+        view = cfg.view
+        if str(view.get("projection")) != "equirectangular_crop":
+            raise ValueError(
+                "panorama_view camera requires view.projection == 'equirectangular_crop'; "
+                f"got {view.get('projection')!r}."
+            )
+        source_size = view.get("source_size")
+        crop = view.get("crop_original_px")
+        if not isinstance(source_size, list) or len(source_size) != 2:
+            raise ValueError("view.source_size must be [width, height].")
+        if not isinstance(crop, list) or len(crop) != 4:
+            raise ValueError("view.crop_original_px must be [x0, y0, x1, y1].")
+
+        self.cfg = cfg
+        self.source_width = int(source_size[0])
+        self.source_height = int(source_size[1])
+        if self.source_width < 2 or self.source_height < 2:
+            raise ValueError(
+                "panorama_view source_size must be at least 2x2; "
+                f"got {self.source_width}x{self.source_height}."
+            )
+        self.crop_x0 = float(crop[0])
+        self.crop_y0 = float(crop[1])
+        self.center_lam = float(view.get("center_yaw_rad", 0.0))
+        self.center_phi = float(view.get("center_pitch_rad", 0.0))
+        self.cx: float = (cfg.width - 1) / 2.0
+        self.cy: float = (cfg.height - 1) / 2.0
+        self.focal_length: None = None
+
+    def pixel_to_direction(self, x: Array, y: Array) -> tuple[Array, Array]:
+        """Convert view-crop pixels to world panorama yaw/pitch directions."""
+        x_arr = np.asarray(x, dtype=np.float64)
+        y_arr = np.asarray(y, dtype=np.float64)
+        setup_x = x_arr + self.crop_x0
+        setup_y = y_arr + self.crop_y0
+        local_lam, local_phi = equirect_pixel_to_angles(setup_x, setup_y, self.source_width, self.source_height)
+        return local_to_world_angles(local_lam, local_phi, self.center_lam, self.center_phi)
+
+    def direction_to_pixel(self, lam: Array, phi: Array) -> tuple[Array, Array]:
+        """Project world panorama yaw/pitch directions to view-crop pixels."""
+        local_lam, local_phi = world_to_local_angles(
+            np.asarray(lam, dtype=np.float64),
+            np.asarray(phi, dtype=np.float64),
+            self.center_lam,
+            self.center_phi,
+        )
+        setup_x, setup_y = angles_to_equirect_pixel(local_lam, local_phi, self.source_width, self.source_height)
+        return setup_x - self.crop_x0, setup_y - self.crop_y0
+
+    def direction_in_fov(self, lam: Array, phi: Array) -> Array:
+        """Check whether directions fall inside the cropped view."""
+        x, y = self.direction_to_pixel(lam, phi)
+        eps = 1e-6
+        return (
+            np.isfinite(x)
+            & np.isfinite(y)
+            & (x >= -eps)
+            & (x <= self.cfg.width - 1 + eps)
+            & (y >= -eps)
+            & (y <= self.cfg.height - 1 + eps)
+        )
+
+
 class Camera:
     """Input camera wrapper preserving the downstream MaDCoW camera API."""
 
@@ -228,8 +305,10 @@ class Camera:
         self.model = _normalize_model(cfg.model)
         if self.model == "pinhole":
             self._camera = _PinholeCamera(cfg)
-        else:
+        elif self.model == "360":
             self._camera = _EquirectangularCamera(cfg)
+        else:
+            self._camera = _PanoramaViewCamera(cfg)
 
         self.focal_length = self._camera.focal_length
         self.cx = self._camera.cx

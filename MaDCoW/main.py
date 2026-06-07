@@ -89,7 +89,7 @@ def parse_args() -> argparse.Namespace:
         ``config`` (str), ``output`` (str), ``crop`` (bool).
     """
     parser = argparse.ArgumentParser(description="MaDCoW marginal distortion correction.")
-    parser.add_argument("--image", default="./MaDCoW/data/test_1.png", help="Path to the input .jpg.")
+    parser.add_argument("--image", default=None, help="Optional input image override.")
     parser.add_argument("--annotations", required=True, help="Path to the annotation JSON.")
     parser.add_argument("--config", default="./MaDCoW/config.json", help="Path to the pipeline config JSON.")
     parser.add_argument("--output", required=True, help="Path of the output image.")
@@ -192,15 +192,41 @@ def load_annotations(path: str) -> AnnotationData:
         regions.append(RegionAnnotation(name=name, mask_path=mask_path))
 
     image_path = _resolve_path(str(data.get("image_path", "")), base_dir) if data.get("image_path") else ""
+    source_image_path = (
+        _resolve_path(str(data.get("source_image_path", "")), base_dir)
+        if data.get("source_image_path")
+        else None
+    )
+    view = data.get("view")
+    if view is not None:
+        view = _require_mapping(view, "annotations.view")
     fov_value = data.get("fov_deg")
     fov_deg = None if fov_value is None else float(fov_value)
     return AnnotationData(
         image_path=image_path,
         fov_deg=fov_deg,
         camera_model=camera_model,
+        source_image_path=source_image_path,
+        view=view,
         lines=lines,
         regions=regions,
     )
+
+
+def resolve_pipeline_image_path(image_arg: str | None, annotations: AnnotationData) -> str:
+    """Return the input image path, rejecting v2 view/image mismatches."""
+    image_path = image_arg or annotations.image_path
+    if not image_path:
+        raise ValueError("No input image path provided in arguments or annotations.")
+    if annotations.view is not None and image_arg:
+        cli_image = str(Path(image_arg).expanduser().resolve())
+        annotation_image = str(Path(annotations.image_path).expanduser().resolve())
+        if cli_image != annotation_image:
+            raise ValueError(
+                "v2 panorama-view annotations must run on annotations.image_path "
+                f"({annotation_image}); got --image {cli_image}."
+            )
+    return image_path
 
 
 def run_pipeline(args: argparse.Namespace) -> None:
@@ -225,9 +251,7 @@ def run_pipeline(args: argparse.Namespace) -> None:
     """
     cfg = load_config(args.config)
     annotations = load_annotations(args.annotations)
-    image_path = args.image or annotations.image_path
-    if not image_path:
-        raise ValueError("No input image path provided in arguments or annotations.")
+    image_path = resolve_pipeline_image_path(args.image, annotations)
     image = _read_image(image_path)
     H_img, W_img = image.shape[:2]
 
@@ -237,6 +261,7 @@ def run_pipeline(args: argparse.Namespace) -> None:
             width=W_img,
             height=H_img,
             model=annotations.camera_model,
+            view=annotations.view,
         )
     )
     mesh = build_input_domain_mesh(

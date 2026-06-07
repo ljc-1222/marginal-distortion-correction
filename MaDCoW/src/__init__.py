@@ -17,7 +17,7 @@ Conventions:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TypeAlias
+from typing import Any, TypeAlias
 
 import numpy as np
 import torch
@@ -34,13 +34,16 @@ class CameraConfig:
         fov_deg: Horizontal field of view of a pinhole input image, in degrees.
         width: Input image width in pixels.
         height: Input image height in pixels.
-        model: Input camera model. Supported values are ``"pinhole"`` and ``"360"``.
+        model: Input camera model. Supported values are ``"pinhole"``, ``"360"``,
+            and ``"panorama_view"``.
+        view: Optional v2 panorama-view metadata.
     """
 
     fov_deg: float | None
     width: int
     height: int
     model: str = "pinhole"
+    view: dict[str, Any] | None = None
 
 
 @dataclass
@@ -92,6 +95,9 @@ class AnnotationData:
         image_path: Path to the input image.
         fov_deg: Horizontal field of view of a pinhole input image in degrees.
         camera_model: Input camera model, either ``"pinhole"`` or ``"360"``.
+        source_image_path: Original source image path when ``image_path`` is a
+            derived annotation view.
+        view: Optional v2 annotation view metadata.
         lines: List of straight-line annotations.
         regions: List of region-of-interest annotations.
     """
@@ -99,6 +105,8 @@ class AnnotationData:
     image_path: str
     fov_deg: float | None
     camera_model: str = "pinhole"
+    source_image_path: str | None = None
+    view: dict[str, Any] | None = None
     lines: list[LineAnnotation] = field(default_factory=list)
     regions: list[RegionAnnotation] = field(default_factory=list)
 

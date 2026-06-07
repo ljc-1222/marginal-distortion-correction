@@ -9,6 +9,8 @@ from typing import Any
 
 import numpy as np
 
+from annotation_gui.io import build_annotation_payload, write_annotation_json
+
 from .config import SnapResult
 from .stroke import clean_stroke
 
@@ -76,7 +78,9 @@ def _madcow_camera_model(camera_type: str) -> str:
         return "pinhole"
     if camera_type == "panorama":
         return "360"
-    raise ValueError(f"camera_type must be 'pinhole' or 'panorama'; got {camera_type!r}.")
+    if camera_type == "panorama_view":
+        return "panorama_view"
+    raise ValueError(f"camera_type must be 'pinhole', 'panorama', or 'panorama_view'; got {camera_type!r}.")
 
 
 def result_to_madcow_line_json(
@@ -106,6 +110,8 @@ def result_to_madcow_annotation_dict(
     image_shape: tuple[int, int],
     camera_type: str,
     fov_deg: float | None = None,
+    source_image_path: str | None = None,
+    view_metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Convert snapped line results to a MaDCoW-compatible annotation JSON."""
     result_list = [results] if isinstance(results, SnapResult) else list(results)
@@ -119,6 +125,8 @@ def result_to_madcow_annotation_dict(
             raise ValueError("fov_deg is required for pinhole MaDCoW annotations.")
         if fov_value <= 0 or fov_value >= 180:
             raise ValueError(f"fov_deg must lie in (0, 180); got {fov_value}.")
+    if camera_model == "panorama_view" and view_metadata is None:
+        raise ValueError("view_metadata is required for panorama_view MaDCoW annotations.")
 
     camera = Camera(
         CameraConfig(
@@ -126,17 +134,20 @@ def result_to_madcow_annotation_dict(
             width=int(width),
             height=int(height),
             model=camera_model,
+            view=view_metadata,
         )
     )
     json_out = Path(output_path).resolve()
-    payload: dict[str, Any] = {
-        "image_path": _relative_path(Path(image_path), json_out.parent),
-        "camera_model": camera_model,
-        "lines": [result_to_madcow_line_json(result, camera) for result in result_list],
-        "regions": [],
-    }
-    if camera_model == "pinhole":
-        payload["fov_deg"] = fov_value
+    payload = build_annotation_payload(
+        image_path=image_path,
+        output_path=json_out,
+        source_image_path=source_image_path,
+        camera_model=camera_model,
+        fov_deg=fov_value if camera_model != "360" else None,
+        view_metadata=view_metadata,
+        lines=[result_to_madcow_line_json(result, camera) for result in result_list],
+        regions=[],
+    )
     return payload
 
 
@@ -147,10 +158,10 @@ def save_madcow_annotation_json(
     image_shape: tuple[int, int],
     camera_type: str,
     fov_deg: float | None = None,
+    source_image_path: str | None = None,
+    view_metadata: dict[str, Any] | None = None,
 ) -> None:
     """Save a MaDCoW-compatible line annotation JSON file."""
-    path = Path(output_path)
-    path.parent.mkdir(parents=True, exist_ok=True)
     data = result_to_madcow_annotation_dict(
         results=results,
         image_path=image_path,
@@ -158,7 +169,7 @@ def save_madcow_annotation_json(
         image_shape=image_shape,
         camera_type=camera_type,
         fov_deg=fov_deg,
+        source_image_path=source_image_path,
+        view_metadata=view_metadata,
     )
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=4)
-        f.write("\n")
+    write_annotation_json(output_path, data)
