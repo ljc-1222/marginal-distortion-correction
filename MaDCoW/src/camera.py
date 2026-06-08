@@ -14,9 +14,8 @@ Conventions:
       ``+Y`` down, ``+Z`` forward along the optical axis.
     * In pinhole mode, the horizontal FOV ``cfg.fov_deg`` determines the
       focal length in pixels via ``f = (width / 2) / tan(fov_rad / 2)``.
-    * Equirectangular mode maps the image width to longitude
-      ``[-pi, pi]`` and the image height to latitude/pitch
-      ``[-pi/2, pi/2]``.
+    * Panorama-view mode maps cropped equirectangular view pixels back to the
+      source panorama angles recorded in the v2 annotation metadata.
     * View-sphere directions ``(lambda, phi)`` are yaw / pitch in radians:
       ``lambda = atan2(X_cam, Z_cam)`` and
       ``phi = atan2(Y_cam, sqrt(X_cam^2 + Z_cam^2))``. With this convention
@@ -39,7 +38,7 @@ from annotation_gui.panorama import (
 from . import Array, CameraConfig
 
 
-_SUPPORTED_MODELS = {"pinhole", "360", "panorama_view"}
+_SUPPORTED_MODELS = {"pinhole", "panorama_view"}
 
 
 def _normalize_model(model: str) -> str:
@@ -170,57 +169,6 @@ class _PinholeCamera:
         return in_bounds
 
 
-class _EquirectangularCamera:
-    """Full 360x180 input camera model using equirectangular projection."""
-
-    def __init__(self, cfg: CameraConfig) -> None:
-        """Initialize a full equirectangular camera from image dimensions."""
-        if cfg.width < 2 or cfg.height < 2:
-            raise ValueError(
-                "360 camera requires width and height of at least 2; "
-                f"got ({cfg.width}, {cfg.height})."
-            )
-
-        self.cfg = cfg
-        self.cx: float = (cfg.width - 1) / 2.0
-        self.cy: float = (cfg.height - 1) / 2.0
-        self.focal_length: None = None
-
-    def pixel_to_direction(self, x: Array, y: Array) -> tuple[Array, Array]:
-        """Convert equirectangular pixel coordinates to yaw/pitch directions."""
-        x_arr = np.asarray(x, dtype=np.float64)
-        y_arr = np.asarray(y, dtype=np.float64)
-
-        lam = (x_arr / float(self.cfg.width - 1)) * (2.0 * math.pi) - math.pi
-        phi = (y_arr / float(self.cfg.height - 1)) * math.pi - (math.pi / 2.0)
-        return lam, phi
-
-    def direction_to_pixel(self, lam: Array, phi: Array) -> tuple[Array, Array]:
-        """Project yaw/pitch directions to equirectangular pixel coordinates."""
-        lam_arr = np.asarray(lam, dtype=np.float64)
-        phi_arr = np.asarray(phi, dtype=np.float64)
-
-        x = ((lam_arr + math.pi) / (2.0 * math.pi)) * float(self.cfg.width - 1)
-        y = ((phi_arr + (math.pi / 2.0)) / math.pi) * float(self.cfg.height - 1)
-        return x, y
-
-    def direction_in_fov(self, lam: Array, phi: Array) -> Array:
-        """Check whether directions lie in the full equirectangular domain."""
-        lam_arr = np.asarray(lam, dtype=np.float64)
-        phi_arr = np.asarray(phi, dtype=np.float64)
-        x, y = self.direction_to_pixel(lam_arr, phi_arr)
-
-        eps = 1e-6
-        return (
-            np.isfinite(lam_arr)
-            & np.isfinite(phi_arr)
-            & (x >= -eps)
-            & (x <= self.cfg.width - 1 + eps)
-            & (y >= -eps)
-            & (y <= self.cfg.height - 1 + eps)
-        )
-
-
 class _PanoramaViewCamera:
     """Cropped centered equirectangular panorama view from v2 annotations."""
 
@@ -305,8 +253,6 @@ class Camera:
         self.model = _normalize_model(cfg.model)
         if self.model == "pinhole":
             self._camera = _PinholeCamera(cfg)
-        elif self.model == "360":
-            self._camera = _EquirectangularCamera(cfg)
         else:
             self._camera = _PanoramaViewCamera(cfg)
 
@@ -350,16 +296,29 @@ if __name__ == "__main__":
     in_fov = camera.direction_in_fov(lam, phi)
     print("in_fov shape, all inside?:", in_fov.shape, bool(in_fov.all()))
 
-    eq_cfg = CameraConfig(fov_deg=None, width=400, height=200, model="360")
-    eq_camera = Camera(eq_cfg)
-    xs = np.arange(eq_cfg.width)
-    ys = np.arange(eq_cfg.height)
+    full_panorama_view = {
+        "projection": "equirectangular_crop",
+        "source_size": [400, 200],
+        "crop_original_px": [0.0, 0.0, 400.0, 200.0],
+        "center_yaw_rad": 0.0,
+        "center_pitch_rad": 0.0,
+    }
+    pano_cfg = CameraConfig(
+        fov_deg=None,
+        width=400,
+        height=200,
+        model="panorama_view",
+        view=full_panorama_view,
+    )
+    pano_camera = Camera(pano_cfg)
+    xs = np.arange(pano_cfg.width)
+    ys = np.arange(pano_cfg.height)
     x_grid, y_grid = np.meshgrid(xs, ys, indexing="xy")
-    lam, phi = eq_camera.pixel_to_direction(x_grid, y_grid)
-    x_back, y_back = eq_camera.direction_to_pixel(lam, phi)
+    lam, phi = pano_camera.pixel_to_direction(x_grid, y_grid)
+    x_back, y_back = pano_camera.direction_to_pixel(lam, phi)
     print(
-        "360 round-trip max err:",
+        "full panorama-view round-trip max err:",
         float(np.max(np.abs(x_back - x_grid))),
         float(np.max(np.abs(y_back - y_grid))),
     )
-    print("360 all inside?:", bool(eq_camera.direction_in_fov(lam, phi).all()))
+    print("full panorama-view all inside?:", bool(pano_camera.direction_in_fov(lam, phi).all()))

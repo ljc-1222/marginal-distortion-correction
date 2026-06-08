@@ -87,7 +87,7 @@ The GUI first asks for the camera/view setup:
 - `Pinhole`: use the original image as a pinhole image. The tool estimates
   horizontal FOV from EXIF when possible, falls back to 90 degrees, and lets the
   user edit the FOV text box before pressing `Done`.
-- `Panorama`: treat the original image as a 360x180 equirectangular source,
+- `Panorama`: treat the original image as an equirectangular panorama source,
   choose a centered/cropped annotation view, then press `Done`. The tool writes
   a derived view image into the output directory and saves
   `camera_model: "panorama_view"` with `source_image_path` and `view` metadata.
@@ -173,13 +173,30 @@ the input horizontal FOV:
 }
 ```
 
-A full equirectangular input can be provided by external tools or manually
-authored annotations using `camera_model: "360"`:
+A full equirectangular panorama is represented with the same v2 schema. It is
+the extreme case of `camera_model: "panorama_view"` where the crop covers the
+whole source image:
 
 ```json
 {
     "image_path": "panorama.jpg",
-    "camera_model": "360",
+    "source_image_path": "panorama.jpg",
+    "camera_model": "panorama_view",
+    "schema_version": 2,
+    "view": {
+        "type": "panorama_view",
+        "source_camera_model": "panorama",
+        "projection": "equirectangular_crop",
+        "source_size": [4000, 2000],
+        "view_size": [4000, 2000],
+        "preview_size": [1200, 600],
+        "center_yaw_rad": 0.0,
+        "center_pitch_rad": 0.0,
+        "crop_original_px": [0.0, 0.0, 4000.0, 2000.0],
+        "crop_preview_px": [0.0, 0.0, 1200.0, 600.0],
+        "horizontal_fov_deg": 360.0,
+        "vertical_fov_deg": 180.0
+    },
     "lines": [],
     "regions": []
 }
@@ -196,7 +213,7 @@ v2 metadata:
     "schema_version": 2,
     "view": {
         "type": "panorama_view",
-        "source_camera_model": "360",
+        "source_camera_model": "panorama",
         "projection": "equirectangular_crop",
         "source_size": [4000, 2000],
         "view_size": [2000, 1000],
@@ -220,7 +237,8 @@ a real-world straight structure. The output line loss forces the warped curve
 samples to become collinear.
 
 Annotations missing `camera_model` are rejected by `main.py`. Supported camera
-models are `pinhole`, `360`, and `panorama_view`.
+models are `pinhole` and `panorama_view`. Full equirectangular panoramas are
+encoded with the v2 `panorama_view` schema.
 
 For `panorama_view` annotations, `main.py` must run on the saved
 `image_path`. Passing `--image` with a different path is rejected to avoid

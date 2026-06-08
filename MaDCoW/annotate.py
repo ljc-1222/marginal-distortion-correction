@@ -38,10 +38,9 @@ FALLBACK_FOV_DEG = 90.0
 PREVIEW_MAX_SIDE = 1200
 LINE_RESAMPLE_POINTS = 128
 LINE_MIN_SPACING_PX = 3.0
-CAMERA_MODEL_CHOICES = ("pinhole", "360", "panorama_view")
+CAMERA_MODEL_CHOICES = ("pinhole", "panorama_view")
 CAMERA_MODEL_LABELS = {
     "pinhole": "Pinhole",
-    "360": "360",
     "panorama_view": "Panorama View",
 }
 if "MPLCONFIGDIR" not in os.environ:

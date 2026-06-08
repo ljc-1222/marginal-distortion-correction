@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import os
 from pathlib import Path
 from typing import Any
@@ -55,32 +54,18 @@ def _resample_to_count(points: np.ndarray, n_samples: int) -> np.ndarray:
     return result.astype(np.float32)
 
 
-def _unwrap_panorama_points_for_resampling(points: np.ndarray, width: int) -> np.ndarray:
-    """Choose continuous panorama x coordinates before arc-length resampling."""
-    if width < 2:
-        raise ValueError(f"Panorama width must be at least 2; got {width}.")
-    period = float(width - 1)
-    unwrapped = np.asarray(points, dtype=np.float64).copy()
-    unwrapped[:, 0] = np.mod(unwrapped[:, 0], period)
-    for idx in range(1, len(unwrapped)):
-        x = float(unwrapped[idx, 0])
-        previous = float(unwrapped[idx - 1, 0])
-        shift = round((previous - x) / period)
-        candidates = np.asarray([x + (shift + delta) * period for delta in (-1, 0, 1)], dtype=np.float64)
-        best = int(np.argmin(np.abs(candidates - previous)))
-        unwrapped[idx, 0] = candidates[best]
-    return unwrapped
-
-
 def _madcow_camera_model(camera_type: str) -> str:
     """Map line-aid camera type names to MaDCoW camera model names."""
     if camera_type == "pinhole":
         return "pinhole"
-    if camera_type == "panorama":
-        return "360"
     if camera_type == "panorama_view":
         return "panorama_view"
-    raise ValueError(f"camera_type must be 'pinhole', 'panorama', or 'panorama_view'; got {camera_type!r}.")
+    if camera_type == "panorama":
+        raise ValueError(
+            "Direct panorama export requires camera_type='panorama_view' "
+            "with v2 view metadata."
+        )
+    raise ValueError(f"camera_type must be 'pinhole' or 'panorama_view'; got {camera_type!r}.")
 
 
 def result_to_madcow_line_json(
@@ -90,12 +75,7 @@ def result_to_madcow_line_json(
 ) -> dict[str, list[list[float]]]:
     """Convert one snapped 2D result into MaDCoW ``points_dir``."""
     points = np.asarray(result.points, dtype=np.float32)
-    if camera.model == "360":
-        points = _unwrap_panorama_points_for_resampling(points, int(camera.cfg.width)).astype(np.float32)
     sampled = _resample_to_count(points, n_samples)
-    if camera.model == "360":
-        sampled[:, 0] = np.mod(sampled[:, 0], float(camera.cfg.width - 1))
-        sampled[:, 1] = np.clip(sampled[:, 1], 0.0, float(camera.cfg.height - 1))
     xs = sampled[:, 0].astype(np.float64)
     ys = sampled[:, 1].astype(np.float64)
     lam, phi = camera.pixel_to_direction(xs, ys)
@@ -143,7 +123,7 @@ def result_to_madcow_annotation_dict(
         output_path=json_out,
         source_image_path=source_image_path,
         camera_model=camera_model,
-        fov_deg=fov_value if camera_model != "360" else None,
+        fov_deg=fov_value if camera_model == "pinhole" else None,
         view_metadata=view_metadata,
         lines=[result_to_madcow_line_json(result, camera) for result in result_list],
         regions=[],

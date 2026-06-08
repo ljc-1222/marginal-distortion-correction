@@ -540,9 +540,6 @@ class EmbeddedViewSetupController:
             if key in ("p", "enter"):
                 self._button_pinhole(event)
                 return True
-            if key in ("360",):
-                self._button_panorama(event)
-                return True
         elif self.state == STATE_PINHOLE_SETUP and key in ("enter", " "):
             self._button_done_pinhole(event)
             return True
@@ -988,8 +985,6 @@ class ViewSetupGUI:
         if self.state == STATE_CAMERA_SELECT:
             if key in ("p", "enter"):
                 self._button_pinhole(event)
-            elif key in ("360",):
-                self._button_panorama(event)
         elif self.state == STATE_PINHOLE_SETUP:
             if key in ("enter", " "):
                 self._button_done_pinhole(event)

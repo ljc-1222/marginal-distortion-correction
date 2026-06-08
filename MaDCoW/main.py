@@ -33,6 +33,7 @@ from .src.weights import compute_weights
 
 
 LINE_ANNOTATION_POINTS = 128
+SUPPORTED_ANNOTATION_CAMERA_MODELS = {"pinhole", "panorama_view"}
 
 
 def _resolve_path(path: str, base_dir: Path) -> str:
@@ -156,6 +157,9 @@ def load_annotations(path: str) -> AnnotationData:
     if "camera_model" not in data:
         raise ValueError("annotations.camera_model must be set by annotate.py.")
     camera_model = str(data["camera_model"])
+    if camera_model not in SUPPORTED_ANNOTATION_CAMERA_MODELS:
+        choices = ", ".join(sorted(SUPPORTED_ANNOTATION_CAMERA_MODELS))
+        raise ValueError(f"annotations.camera_model must be one of: {choices}; got {camera_model!r}.")
 
     lines: list[LineAnnotation] = []
     for idx, item in enumerate(lines_raw):
@@ -200,6 +204,11 @@ def load_annotations(path: str) -> AnnotationData:
     view = data.get("view")
     if view is not None:
         view = _require_mapping(view, "annotations.view")
+    if camera_model == "panorama_view":
+        if data.get("schema_version") != 2:
+            raise ValueError("panorama_view annotations must contain schema_version: 2.")
+        if view is None:
+            raise ValueError("panorama_view annotations must contain view metadata.")
     fov_value = data.get("fov_deg")
     fov_deg = None if fov_value is None else float(fov_value)
     return AnnotationData(

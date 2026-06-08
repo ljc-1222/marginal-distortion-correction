@@ -14,6 +14,7 @@ from PIL import Image, ImageDraw
 
 from annotation_gui.base import add_button_row, create_image_figure
 from annotation_gui.io import build_annotation_payload, write_annotation_json
+from annotation_gui.panorama import full_panorama_view_metadata
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -42,17 +43,11 @@ HIT_TOLERANCE_PX = 8.0
 DEFAULT_IMAGE = BASE_DIR / "data" / "test_1.jpg"
 DEFAULT_OUTPUT_DIR = BASE_DIR / "data"
 DEFAULT_SELECTION_CONFIG = BASE_DIR / "config" / "line_selection.json"
-DEFAULT_FOCAL_LENGTH_MM = 13.0
-DEFAULT_SENSOR_WIDTH_MM = 36.0
+PANORAMA_CAMERA_MODEL = "panorama_view"
+PANORAMA_MODEL_NAME = "spherical.pkl"
 
-CAMERA_MODEL_CHOICES = ("pinhole", "360")
 CAMERA_MODEL_LABELS = {
-    "pinhole": "Pinhole",
-    "360": "360",
-}
-MODEL_BY_CAMERA = {
-    "pinhole": "pinhole.pkl",
-    "360": "spherical.pkl",
+    "panorama_view": "Panorama",
 }
 
 
@@ -84,7 +79,7 @@ def parse_args():
         "--model-name",
         dest="model_name",
         default="",
-        help="ULSD model filename. Defaults to the camera-specific model.",
+        help=f"ULSD model filename. Defaults to {PANORAMA_MODEL_NAME}.",
     )
     parser.add_argument("--order", type=int, default=4, choices=[1, 2, 3, 4, 5, 6])
     parser.add_argument("--gpu", type=int, default=-1, help="GPU id. Use -1 for CPU.")
@@ -103,13 +98,6 @@ def parse_args():
 
     parser.add_argument("--num_workers", "--num-workers", dest="num_workers", type=int, default=0)
     return parser.parse_args()
-
-
-def _normalize_camera_model(model: str) -> str:
-    if model in CAMERA_MODEL_CHOICES:
-        return model
-    choices = ", ".join(CAMERA_MODEL_CHOICES)
-    raise ValueError(f"camera_model must be one of: {choices}; got {model!r}.")
 
 
 def _lanczos_resampling() -> int:
@@ -206,25 +194,10 @@ def load_selection_config(
     )
 
 
-def horizontal_fov_deg(focal_length_mm: float, sensor_width_mm: float) -> float:
-    if focal_length_mm <= 0:
-        raise ValueError(f"focal_length_mm must be positive; got {focal_length_mm}.")
-    if sensor_width_mm <= 0:
-        raise ValueError(f"sensor_width_mm must be positive; got {sensor_width_mm}.")
-    return math.degrees(2.0 * math.atan(sensor_width_mm / (2.0 * focal_length_mm)))
-
-
-def resolve_pinhole_fov() -> float:
-    fov_deg = horizontal_fov_deg(DEFAULT_FOCAL_LENGTH_MM, DEFAULT_SENSOR_WIDTH_MM)
-    if not 0.0 < fov_deg < 180.0:
-        raise ValueError(f"fov_deg must be in (0, 180); got {fov_deg}.")
-    return float(fov_deg)
-
-
-def model_name_for_camera(camera_model: str, model_override: str = "") -> str:
+def model_name_for_camera(model_override: str = "") -> str:
     if model_override:
         return model_override
-    return MODEL_BY_CAMERA[_normalize_camera_model(camera_model)]
+    return PANORAMA_MODEL_NAME
 
 
 def load_cfg(args: argparse.Namespace, model_name: str, selection: SelectionConfig):
@@ -398,9 +371,8 @@ class AutoLineReviewGUI:
         self.json_path.parent.mkdir(parents=True, exist_ok=True)
         self.marked_image_path.parent.mkdir(parents=True, exist_ok=True)
 
-        self.camera_model = _normalize_camera_model("360")
+        self.camera_model = PANORAMA_CAMERA_MODEL
         self.detected_camera_model = self.camera_model
-        self.pinhole_fov_deg = resolve_pinhole_fov()
         self.selection_config_path = Path(args.selection_config)
         self.score_override = args.score_thresh
         self.top_k_override = args.top_k
@@ -422,6 +394,11 @@ class AutoLineReviewGUI:
             preview = Image.fromarray(self.original_image).resize(preview_size, _lanczos_resampling())
             self.preview_image = np.asarray(preview)
         self.preview_height, self.preview_width = self.preview_image.shape[:2]
+        self.view_metadata = full_panorama_view_metadata(
+            self.original_width,
+            self.original_height,
+            preview_size=(self.preview_width, self.preview_height),
+        )
 
         self.candidates: list[LineCandidate] = []
         self.history: list[tuple[str, LineCandidate]] = []
@@ -492,7 +469,7 @@ class AutoLineReviewGUI:
             self.top_k_override,
             self.duplicate_dist_override,
         )
-        self.current_model_name = model_name_for_camera(self.camera_model, self.model_override)
+        self.current_model_name = model_name_for_camera(self.model_override)
         cfg = load_cfg(self.args, self.current_model_name, self.selection)
         self.use_gpu = cfg.gpu >= 0 and torch.cuda.is_available()
         device = torch.device(f"cuda:{cfg.gpu}" if self.use_gpu else "cpu")
@@ -576,13 +553,13 @@ class AutoLineReviewGUI:
         return original
 
     def _annotation_camera(self) -> Camera:
-        fov = self.pinhole_fov_deg if self.camera_model == "pinhole" else None
         return Camera(
             CameraConfig(
-                fov_deg=fov,
+                fov_deg=None,
                 width=self.original_width,
                 height=self.original_height,
                 model=self.camera_model,
+                view=self.view_metadata,
             )
         )
 
@@ -825,8 +802,9 @@ class AutoLineReviewGUI:
         payload = build_annotation_payload(
             image_path=self.image_path,
             output_path=self.json_path,
+            source_image_path=self.image_path,
             camera_model=self.camera_model,
-            fov_deg=self.pinhole_fov_deg if self.camera_model == "pinhole" else None,
+            view_metadata=self.view_metadata,
             lines=self._line_json(),
             regions=[],
         )
@@ -884,8 +862,6 @@ class AutoLineReviewGUI:
         if (self.preview_width, self.preview_height) != (self.original_width, self.original_height):
             size_text += f" -> Original: {self.original_width}x{self.original_height}"
         camera_text = f"Camera: {CAMERA_MODEL_LABELS[self.camera_model]}"
-        if self.camera_model == "pinhole":
-            camera_text += f" ({self.pinhole_fov_deg:.2f} deg)"
         pending = " | Rerun required" if self.needs_rerun else ""
         self.status.set_text(
             f"{camera_text} | Model: {self.current_model_name} | use_gpu: {self.use_gpu} | "

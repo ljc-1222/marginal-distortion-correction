@@ -34,8 +34,10 @@ class CameraConfig:
         fov_deg: Horizontal field of view of a pinhole input image, in degrees.
         width: Input image width in pixels.
         height: Input image height in pixels.
-        model: Input camera model. Supported values are ``"pinhole"``, ``"360"``,
-            and ``"panorama_view"``.
+        model: Input camera model. Supported values are ``"pinhole"`` and
+            ``"panorama_view"``. A full equirectangular panorama is represented
+            as a ``"panorama_view"`` whose metadata crop covers the whole
+            source image.
         view: Optional v2 panorama-view metadata.
     """
 
@@ -94,7 +96,8 @@ class AnnotationData:
     Attributes:
         image_path: Path to the input image.
         fov_deg: Horizontal field of view of a pinhole input image in degrees.
-        camera_model: Input camera model, either ``"pinhole"`` or ``"360"``.
+        camera_model: Input camera model, either ``"pinhole"`` or
+            ``"panorama_view"``.
         source_image_path: Original source image path when ``image_path`` is a
             derived annotation view.
         view: Optional v2 annotation view metadata.

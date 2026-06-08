@@ -61,9 +61,9 @@ is reviewed before conversion to MaDCoW `lines[].points_dir`.
 
 ## Run Line Review
 
-Use your own input image path. The current GUI initializes `camera_model` as
-`360`, so it uses `spherical.pkl` unless `--model-name` overrides the model
-filename.
+Use your own input image path. The current GUI treats the input as a full
+equirectangular panorama, uses `spherical.pkl` unless `--model-name` overrides
+the model filename, and exports MaDCoW v2 `panorama_view` metadata.
 
 ```bash
 ./.venv/bin/python -m ULSD.annotate_line_auto \
@@ -103,12 +103,29 @@ Common optional arguments:
 ## JSON Output
 
 Save writes `<stem>.json` and a marked selected-line image. The JSON contains
-line annotations and no ROIs:
+line annotations and no ROIs. A full equirectangular panorama is recorded as a
+`panorama_view` whose crop covers the whole source image:
 
 ```json
 {
   "image_path": "input.jpg",
-  "camera_model": "360",
+  "source_image_path": "input.jpg",
+  "camera_model": "panorama_view",
+  "schema_version": 2,
+  "view": {
+    "type": "panorama_view",
+    "source_camera_model": "panorama",
+    "projection": "equirectangular_crop",
+    "source_size": [4000, 2000],
+    "view_size": [4000, 2000],
+    "preview_size": [1200, 600],
+    "center_yaw_rad": 0.0,
+    "center_pitch_rad": 0.0,
+    "crop_original_px": [0.0, 0.0, 4000.0, 2000.0],
+    "crop_preview_px": [0.0, 0.0, 1200.0, 600.0],
+    "horizontal_fov_deg": 360.0,
+    "vertical_fov_deg": 180.0
+  },
   "lines": [
     {
       "points_dir": [[-3.02, -1.45], "... 126 more samples ..."]

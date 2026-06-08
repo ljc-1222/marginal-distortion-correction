@@ -185,7 +185,7 @@ class PanoramaViewResult:
     def metadata(self) -> dict[str, object]:
         return {
             "type": "panorama_view",
-            "source_camera_model": "360",
+            "source_camera_model": "panorama",
             "projection": "equirectangular_crop",
             "source_size": [int(self.source_size[0]), int(self.source_size[1])],
             "view_size": [int(self.image_view.width), int(self.image_view.height)],
@@ -197,6 +197,31 @@ class PanoramaViewResult:
             "horizontal_fov_deg": float(self.horizontal_fov_deg),
             "vertical_fov_deg": float(self.vertical_fov_deg),
         }
+
+
+def full_panorama_view_metadata(
+    width: int,
+    height: int,
+    preview_size: tuple[int, int] | None = None,
+) -> dict[str, object]:
+    """Return v2 metadata for a full equirectangular panorama annotation view."""
+    if width < MIN_VIEW_SIZE or height < MIN_VIEW_SIZE:
+        raise ValueError(f"Panorama source size must be at least 2x2; got {width}x{height}.")
+    preview_width, preview_height = preview_size or (width, height)
+    return {
+        "type": "panorama_view",
+        "source_camera_model": "panorama",
+        "projection": "equirectangular_crop",
+        "source_size": [int(width), int(height)],
+        "view_size": [int(width), int(height)],
+        "preview_size": [int(preview_width), int(preview_height)],
+        "center_yaw_rad": 0.0,
+        "center_pitch_rad": 0.0,
+        "crop_original_px": [0.0, 0.0, float(width), float(height)],
+        "crop_preview_px": [0.0, 0.0, float(preview_width), float(preview_height)],
+        "horizontal_fov_deg": 360.0,
+        "vertical_fov_deg": 180.0,
+    }
 
 
 def build_panorama_view(

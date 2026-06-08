@@ -125,8 +125,6 @@ def _lanczos_resampling() -> int:
 
 def _normalize_camera_type(camera_type: str) -> str:
     """Normalize GUI camera type aliases."""
-    if camera_type == "360":
-        camera_type = "panorama"
     if camera_type not in CAMERA_TYPE_CHOICES:
         raise ValueError(f"camera_type must be one of {CAMERA_TYPE_CHOICES}; got {camera_type!r}.")
     return camera_type
