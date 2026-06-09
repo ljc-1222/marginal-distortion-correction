@@ -16,7 +16,7 @@ from annotation_gui import AnnotationSession, render_centered_equirectangular
 from annotation_gui.base import add_button_row, add_text_box, clear_widget_axes, create_image_figure, set_image_artist
 
 from .snap2d import SnapConfig, SnapResult, load_snap_config, snap_annotation
-from .snap2d.io import save_madcow_annotation_json
+from .snap2d.io import result_to_madcow_annotation_dict, save_madcow_annotation_json
 
 
 DEFAULT_IMAGE = Path(__file__).resolve().parent / "data" / "test_1.jpg"
@@ -265,7 +265,20 @@ class LineAidAnnotationGUI:
         output_dir: str,
         camera_type: str = "pinhole",
         snap_config: SnapConfig | None = None,
+        initial_session: AnnotationSession | None = None,
+        json_path: str | Path | None = None,
+        fig: Any | None = None,
+        ax: Any | None = None,
+        image_artist: Any | None = None,
+        status: Any | None = None,
+        help_text: Any | None = None,
+        widgets: list[Any] | None = None,
+        on_complete: Any | None = None,
+        save_close_label: str = "Save+Close",
     ) -> None:
+        external_items = (fig, ax, image_artist, status, help_text)
+        if any(item is not None for item in external_items) and not all(item is not None for item in external_items):
+            raise ValueError("fig, ax, image_artist, status, and help_text must be provided together.")
         self.image_path = str(Path(image_path).resolve())
         self.initial_camera_type = _normalize_camera_type(camera_type)
         self.camera_type: str | None = None
@@ -278,7 +291,8 @@ class LineAidAnnotationGUI:
         self.output_dir = Path(output_dir).resolve()
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
-        self.session = AnnotationSession.from_image(self.image_path, PREVIEW_MAX_SIDE, self.fov_deg)
+        self.session = initial_session or AnnotationSession.from_image(self.image_path, PREVIEW_MAX_SIDE, self.fov_deg)
+        self.image_path = self.session.image_path if initial_session is not None else self.image_path
         self.original_image = self.session.source_view.image
         self.preview_image = self.session.source_view.preview
         self.original_width = self.session.source_view.width
@@ -310,18 +324,61 @@ class LineAidAnnotationGUI:
         self.annotation_center_phi = 0.0
         self.annotation_crop_box = self.panorama_crop_box
         self.annotation_crop_origin = (0.0, 0.0)
+        self.on_complete = on_complete
+        self.save_close_label = save_close_label
+        self._connection_ids: list[int] = []
 
         stem = Path(self.image_path).stem
-        self.json_path = self.output_dir / f"{stem}.json"
+        self.json_path = Path(json_path).resolve() if json_path is not None else self.output_dir / f"{stem}.json"
 
-        self._build_figure()
-        self._show_camera_select()
+        if fig is None:
+            self._build_figure()
+        else:
+            self._attach_figure(fig, ax, image_artist, status, help_text, widgets)
+        if initial_session is None:
+            self._show_camera_select()
+        else:
+            self.enter_annotation_session(initial_session)
 
     def run(self) -> None:
         """Open the Matplotlib GUI and block until it closes."""
         import matplotlib.pyplot as plt
 
         plt.show()
+
+    @classmethod
+    def from_session(
+        cls,
+        session: AnnotationSession,
+        output_dir: str | Path,
+        snap_config: SnapConfig | None = None,
+        json_path: str | Path | None = None,
+        fig: Any | None = None,
+        ax: Any | None = None,
+        image_artist: Any | None = None,
+        status: Any | None = None,
+        help_text: Any | None = None,
+        widgets: list[Any] | None = None,
+        on_complete: Any | None = None,
+        save_close_label: str = "Save+Close",
+    ) -> "LineAidAnnotationGUI":
+        """Create a line snapping GUI that starts from a prepared annotation session."""
+        return cls(
+            image_path=session.image_path,
+            fov_deg=session.fov_deg,
+            output_dir=str(output_dir),
+            snap_config=snap_config,
+            initial_session=session,
+            json_path=json_path,
+            fig=fig,
+            ax=ax,
+            image_artist=image_artist,
+            status=status,
+            help_text=help_text,
+            widgets=widgets,
+            on_complete=on_complete,
+            save_close_label=save_close_label,
+        )
 
     def _build_figure(self) -> None:
         """Create the figure, controls, and event callbacks."""
@@ -337,10 +394,45 @@ class LineAidAnnotationGUI:
         self.fov_box: Any | None = None
         self._syncing_fov_box = False
 
-        self.fig.canvas.mpl_connect("button_press_event", self._on_click)
-        self.fig.canvas.mpl_connect("motion_notify_event", self._on_motion)
-        self.fig.canvas.mpl_connect("button_release_event", self._on_release)
-        self.fig.canvas.mpl_connect("key_press_event", self._on_key)
+        self._connect_events()
+
+    def _attach_figure(
+        self,
+        fig: Any,
+        ax: Any,
+        image_artist: Any,
+        status: Any,
+        help_text: Any,
+        widgets: list[Any] | None,
+    ) -> None:
+        """Attach line annotation to an existing Matplotlib figure."""
+        self.blank_image = np.full((max(1, self.preview_height), max(1, self.preview_width), 3), 245, dtype=np.uint8)
+        self.fig = fig
+        self.ax = ax
+        self.image_artist = image_artist
+        self.status = status
+        self.help_text = help_text
+        self.widgets = widgets if widgets is not None else []
+        self._buttons = {}
+        self.mode_radio = None
+        self.fov_box = None
+        self._syncing_fov_box = False
+        self._connect_events()
+
+    def _connect_events(self) -> None:
+        """Connect line-aid event handlers and retain ids for integrated GUI reuse."""
+        self._connection_ids = [
+            self.fig.canvas.mpl_connect("button_press_event", self._on_click),
+            self.fig.canvas.mpl_connect("motion_notify_event", self._on_motion),
+            self.fig.canvas.mpl_connect("button_release_event", self._on_release),
+            self.fig.canvas.mpl_connect("key_press_event", self._on_key),
+        ]
+
+    def disconnect_events(self) -> None:
+        """Disconnect line-aid event handlers from the figure."""
+        for connection_id in self._connection_ids:
+            self.fig.canvas.mpl_disconnect(connection_id)
+        self._connection_ids.clear()
 
     def _clear_controls(self) -> None:
         """Remove all current-state controls from the figure."""
@@ -372,7 +464,7 @@ class LineAidAnnotationGUI:
             ("redraw", "Redraw", 0.09, self._button_redraw),
             ("next", "Next", 0.09, self._button_next),
             ("save", "Save", 0.09, self._button_save),
-            ("save_close", "Save+Close", 0.13, self._button_save_close),
+            ("save_close", self.save_close_label, 0.13, self._button_save_close),
         ]
         created = add_button_row(
             self.fig,
@@ -550,6 +642,53 @@ class LineAidAnnotationGUI:
         self.status_extra = "Draw a rough stroke. Then choose Redraw or Next."
         self._refresh()
 
+    def enter_annotation_session(self, session: AnnotationSession) -> None:
+        """Enter line annotation using an already finalized shared session."""
+        if session.camera_model not in ("pinhole", "panorama_view"):
+            raise ValueError(f"Unsupported annotation camera model: {session.camera_model!r}.")
+        if session.camera_model == "pinhole" and session.fov_deg is None:
+            raise ValueError("pinhole annotation session must define fov_deg.")
+
+        self.session = session
+        self.image_path = session.image_path
+        self.camera_type = str(session.camera_model)
+        self.fov_deg = session.fov_deg
+        self.original_image = session.source_view.image
+        self.preview_image = session.source_view.preview
+        self.original_width = session.source_view.width
+        self.original_height = session.source_view.height
+        self.preview_width = session.source_view.preview_width
+        self.preview_height = session.source_view.preview_height
+        self.is_downsampled = session.source_view.is_downsampled
+        self.state = STATE_ANNOTATE
+        self.snap_mode = "line"
+        self.annotations.clear()
+        self.pending = None
+        self.current_stroke = []
+        self._drawing_stroke = False
+        self._drag_action = None
+        self._drag_start_xy = None
+        self._drag_start_center = None
+        self._drag_start_crop = None
+        self._clear_dynamic_artists()
+        self._set_annotation_controls()
+        self._set_axes_visible(True)
+
+        self.annotation_original_image = session.image
+        self.annotation_image = session.preview
+        self.annotation_setup_image = None
+        if session.panorama_result is not None:
+            self.annotation_center_lam = float(session.panorama_result.center_yaw_rad)
+            self.annotation_center_phi = float(session.panorama_result.center_pitch_rad)
+            self.annotation_crop_box = session.panorama_result.crop_original_px
+        else:
+            self.annotation_center_lam = 0.0
+            self.annotation_center_phi = 0.0
+            self.annotation_crop_box = (0.0, 0.0, float(session.width), float(session.height))
+        self.annotation_crop_origin = (0.0, 0.0)
+        self.status_extra = "Draw a rough stroke. Then choose Redraw or Next."
+        self._refresh()
+
     def _set_fov_value(self, value: float) -> bool:
         """Validate and store the pinhole FOV value."""
         if not math.isfinite(value) or value <= 0.0 or value >= 180.0:
@@ -641,6 +780,9 @@ class LineAidAnnotationGUI:
 
     def _button_save_close(self, _event: object) -> None:
         if self._save():
+            if self.on_complete is not None:
+                self.on_complete(self)
+                return
             import matplotlib.pyplot as plt
 
             plt.close(self.fig)
@@ -992,6 +1134,22 @@ class LineAidAnnotationGUI:
     def _results_for_save(self) -> list[SnapResult]:
         """Return accepted snapped results for export."""
         return [item.result for item in self.annotations]
+
+    def export_lines(self, output_path: str | Path) -> list[dict[str, list[list[float]]]]:
+        """Return MaDCoW ``lines[]`` entries for accepted snapped results."""
+        if self.pending is not None:
+            self._accept_pending()
+        payload = result_to_madcow_annotation_dict(
+            self._results_for_save(),
+            self.session.image_path,
+            str(output_path),
+            image_shape=(self.session.height, self.session.width),
+            camera_type=str(self.camera_type),
+            fov_deg=self.fov_deg,
+            source_image_path=self.session.source_image_path if self.session.view_metadata is not None else None,
+            view_metadata=self.session.view_metadata,
+        )
+        return list(payload["lines"])
 
     def _save(self) -> bool:
         """Save accepted annotations, accepting the pending result first if needed."""

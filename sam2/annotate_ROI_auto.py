@@ -196,6 +196,11 @@ def _resolve_device(device: str) -> str:
     return device
 
 
+def resolve_device(device: str) -> str:
+    """Public wrapper for resolving the requested SAM2 device."""
+    return _resolve_device(device)
+
+
 @contextlib.contextmanager
 def _inference_context(device: str) -> Iterator[None]:
     """Run SAM2 prediction under inference mode and CUDA autocast when useful."""
@@ -217,6 +222,11 @@ def _resolve_checkpoint(path: str) -> Path:
     return (Path.cwd() / checkpoint).resolve()
 
 
+def resolve_checkpoint(path: str) -> Path:
+    """Public wrapper for resolving SAM2 checkpoint paths."""
+    return _resolve_checkpoint(path)
+
+
 def _normalize_model_cfg(model_cfg: str) -> str:
     """Convert an existing config path into a Hydra config name when possible."""
     cfg_path = Path(model_cfg).expanduser()
@@ -230,6 +240,11 @@ def _normalize_model_cfg(model_cfg: str) -> str:
         except ValueError:
             return model_cfg
     return model_cfg
+
+
+def normalize_model_cfg(model_cfg: str) -> str:
+    """Public wrapper for normalizing SAM2 model config names."""
+    return _normalize_model_cfg(model_cfg)
 
 
 def build_image_predictor(model_cfg: str, checkpoint: Path, device: str) -> Any:
@@ -256,23 +271,49 @@ class SAM2ROIAnnotationGUI:
         source_image_path: str | None = None,
         view_metadata: dict[str, Any] | None = None,
         start_with_setup: bool = False,
+        initial_session: AnnotationSession | None = None,
+        json_path: str | Path | None = None,
+        fig: Any | None = None,
+        ax: Any | None = None,
+        image_artist: Any | None = None,
+        status: Any | None = None,
+        help_text: Any | None = None,
+        widgets: list[Any] | None = None,
+        on_complete: Any | None = None,
+        save_close_label: str = "Save+Close",
     ) -> None:
+        if start_with_setup and initial_session is not None:
+            raise ValueError("start_with_setup cannot be used with initial_session.")
+        external_items = (fig, ax, image_artist, status, help_text)
+        if any(item is not None for item in external_items) and not all(item is not None for item in external_items):
+            raise ValueError("fig, ax, image_artist, status, and help_text must be provided together.")
         if fov_deg <= 0 or fov_deg >= 180:
             raise ValueError(f"fov_deg must lie in (0, 180); got {fov_deg}.")
 
-        self.image_path = str(Path(image_path).resolve())
-        self.fov_deg = float(fov_deg)
         self.output_dir = Path(output_dir).resolve()
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.predictor = predictor
         self.device = device
-        self.camera_model = str(camera_model)
-        self.source_image_path = source_image_path
-        self.view_metadata = view_metadata
         self.preview_max_side = PREVIEW_MAX_SIDE
 
-        self.session = AnnotationSession.from_image(self.image_path, self.preview_max_side, self.fov_deg)
-        self.image_view = load_image_view(self.image_path, self.preview_max_side)
+        if initial_session is None:
+            self.image_path = str(Path(image_path).resolve())
+            self.fov_deg = float(fov_deg)
+            self.camera_model = str(camera_model)
+            self.source_image_path = source_image_path
+            self.view_metadata = view_metadata
+            self.session = AnnotationSession.from_image(self.image_path, self.preview_max_side, self.fov_deg)
+            self.image_view = load_image_view(self.image_path, self.preview_max_side)
+        else:
+            self.session = initial_session
+            self.image_path = initial_session.image_path
+            self.fov_deg = float(initial_session.fov_deg)
+            self.camera_model = str(initial_session.camera_model)
+            self.source_image_path = (
+                initial_session.source_image_path if initial_session.view_metadata is not None else source_image_path
+            )
+            self.view_metadata = initial_session.view_metadata
+            self.image_view = initial_session.active_view
         self.original_image = self.image_view.image
         self.original_width = self.image_view.width
         self.original_height = self.image_view.height
@@ -291,9 +332,15 @@ class SAM2ROIAnnotationGUI:
         self._dynamic_artists: list[Any] = []
         self.setup_controller: EmbeddedViewSetupController | None = None
         self.message = ""
-        self.json_path = self.output_dir / f"{Path(self.image_path).stem}.json"
+        self.json_path = Path(json_path).resolve() if json_path is not None else self.output_dir / f"{Path(self.image_path).stem}.json"
+        self.on_complete = on_complete
+        self.save_close_label = save_close_label
+        self._connection_ids: list[int] = []
 
-        self._build_figure()
+        if fig is None:
+            self._build_figure()
+        else:
+            self._attach_figure(fig, ax, image_artist, status, help_text, widgets)
         if start_with_setup:
             self._start_view_setup()
         else:
@@ -308,6 +355,48 @@ class SAM2ROIAnnotationGUI:
 
         plt.show()
 
+    @classmethod
+    def from_session(
+        cls,
+        session: AnnotationSession,
+        output_dir: str | Path,
+        predictor: Any,
+        device: str,
+        json_path: str | Path | None = None,
+        fig: Any | None = None,
+        ax: Any | None = None,
+        image_artist: Any | None = None,
+        status: Any | None = None,
+        help_text: Any | None = None,
+        widgets: list[Any] | None = None,
+        on_complete: Any | None = None,
+        save_close_label: str = "Save+Close",
+    ) -> "SAM2ROIAnnotationGUI":
+        """Create an ROI GUI that starts directly from a prepared annotation session."""
+        if session.fov_deg is None:
+            raise ValueError("A prepared annotation session must define fov_deg before ROI annotation.")
+        return cls(
+            image_path=session.image_path,
+            fov_deg=float(session.fov_deg),
+            output_dir=str(output_dir),
+            predictor=predictor,
+            device=device,
+            camera_model=str(session.camera_model),
+            source_image_path=session.source_image_path if session.view_metadata is not None else None,
+            view_metadata=session.view_metadata,
+            start_with_setup=False,
+            initial_session=session,
+            json_path=json_path,
+            fig=fig,
+            ax=ax,
+            image_artist=image_artist,
+            status=status,
+            help_text=help_text,
+            widgets=widgets,
+            on_complete=on_complete,
+            save_close_label=save_close_label,
+        )
+
     def _build_figure(self) -> None:
         """Create the figure, widgets, and event callbacks."""
         self.fig, self.ax, self.image_artist, self.status, self.help_text = create_image_figure(
@@ -317,10 +406,57 @@ class SAM2ROIAnnotationGUI:
         self.mask_artist = self.ax.imshow(np.zeros((self.height, self.width, 4)), interpolation="nearest")
 
         self.widgets: list[Any] = []
-        self.fig.canvas.mpl_connect("button_press_event", self._on_click)
-        self.fig.canvas.mpl_connect("motion_notify_event", self._on_motion)
-        self.fig.canvas.mpl_connect("button_release_event", self._on_release)
-        self.fig.canvas.mpl_connect("key_press_event", self._on_key)
+        self._connect_events()
+
+    def _attach_figure(
+        self,
+        fig: Any,
+        ax: Any,
+        image_artist: Any,
+        status: Any,
+        help_text: Any,
+        widgets: list[Any] | None,
+    ) -> None:
+        """Attach the ROI phase to an existing Matplotlib figure."""
+        self.fig = fig
+        self.ax = ax
+        self.image_artist = image_artist
+        self.status = status
+        self.help_text = help_text
+        self.widgets = widgets if widgets is not None else []
+        set_image_artist(self.image_artist, self.ax, self.image)
+        self.mask_artist = self.ax.imshow(
+            np.zeros((self.height, self.width, 4)),
+            interpolation="nearest",
+            extent=(-0.5, self.width - 0.5, self.height - 0.5, -0.5),
+        )
+        self._connect_events()
+
+    def _connect_events(self) -> None:
+        """Connect ROI event handlers and retain ids for integrated GUI reuse."""
+        self._connection_ids = [
+            self.fig.canvas.mpl_connect("button_press_event", self._on_click),
+            self.fig.canvas.mpl_connect("motion_notify_event", self._on_motion),
+            self.fig.canvas.mpl_connect("button_release_event", self._on_release),
+            self.fig.canvas.mpl_connect("key_press_event", self._on_key),
+        ]
+
+    def disconnect_events(self) -> None:
+        """Disconnect ROI event handlers from the figure."""
+        for connection_id in self._connection_ids:
+            self.fig.canvas.mpl_disconnect(connection_id)
+        self._connection_ids.clear()
+
+    def detach_for_reuse(self) -> None:
+        """Remove ROI-specific GUI state before another phase reuses the figure."""
+        self.disconnect_events()
+        self._clear_controls()
+        self._clear_dynamic_artists()
+        try:
+            self.mask_artist.remove()
+        except ValueError:
+            pass
+        self.fig.canvas.draw_idle()
 
     def _clear_controls(self) -> None:
         """Remove the current control widgets."""
@@ -344,7 +480,7 @@ class SAM2ROIAnnotationGUI:
             ("Redraw", 0.09, self._button_redraw_region),
             ("Next ROI", 0.105, self._button_next_region),
             ("Save", 0.075, self._button_save),
-            ("Save+Close", 0.12, self._button_save_close),
+            (self.save_close_label, 0.12, self._button_save_close),
         ]
         add_button_row(self.fig, self.widgets, buttons, y0=0.075)
 
@@ -473,6 +609,9 @@ class SAM2ROIAnnotationGUI:
 
     def _button_save_close(self, _event: object) -> None:
         self._save(str(self.json_path))
+        if self.on_complete is not None:
+            self.on_complete(self)
+            return
         import matplotlib.pyplot as plt
 
         plt.close(self.fig)
@@ -778,10 +917,11 @@ class SAM2ROIAnnotationGUI:
         ys, xs = np.nonzero(preview_mask)
         return float(xs[0]), float(ys[0])
 
-    def _save(self, json_path: str) -> None:
-        """Write predicted masks and the MaDCoW-compatible JSON."""
-        json_out = Path(json_path).resolve()
-        json_out.parent.mkdir(parents=True, exist_ok=True)
+    def export_regions(self, mask_dir: str | Path, json_base_dir: str | Path) -> list[dict[str, str]]:
+        """Write predicted masks and return MaDCoW ``regions[]`` entries."""
+        mask_out = Path(mask_dir).resolve()
+        json_dir = Path(json_base_dir).resolve()
+        mask_out.mkdir(parents=True, exist_ok=True)
         used_names: set[str] = set()
         regions_json: list[dict[str, str]] = []
 
@@ -797,14 +937,22 @@ class SAM2ROIAnnotationGUI:
                 suffix += 1
             used_names.add(unique_name)
 
-            mask_path = json_out.parent / f"mask_{unique_name}.png"
+            mask_path = mask_out / f"mask_{unique_name}.png"
             Image.fromarray((mask.astype(np.uint8) * 255)).save(mask_path)
             regions_json.append(
                 {
                     "name": str(region["name"]),
-                    "mask_path": _relative_path(mask_path, json_out.parent),
+                    "mask_path": _relative_path(mask_path, json_dir),
                 }
             )
+
+        return regions_json
+
+    def _save(self, json_path: str) -> None:
+        """Write predicted masks and the MaDCoW-compatible JSON."""
+        json_out = Path(json_path).resolve()
+        json_out.parent.mkdir(parents=True, exist_ok=True)
+        regions_json = self.export_regions(json_out.parent, json_out.parent)
 
         payload = build_annotation_payload(
             image_path=self.image_path,
