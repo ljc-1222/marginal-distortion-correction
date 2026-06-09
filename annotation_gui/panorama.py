@@ -9,7 +9,7 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
-from .image import ImageView, relative_path, resize_rgb_preview, unique_output_path
+from .image import ImageView, relative_path, resize_rgb_preview
 
 
 MAX_FOV_DEG = 179.0
@@ -255,7 +255,9 @@ def build_panorama_view(
         source_view.height,
     )
     rendered = centered[iy0:iy1, ix0:ix1].copy()
-    output_path = unique_output_path(Path(output_dir), source_view.path.stem, output_suffix, ".png")
+    output_dir_path = Path(output_dir)
+    output_dir_path.mkdir(parents=True, exist_ok=True)
+    output_path = output_dir_path / f"{source_view.path.stem}{output_suffix}.png"
     Image.fromarray(rendered).save(output_path)
     image_view = ImageView(
         path=output_path,
