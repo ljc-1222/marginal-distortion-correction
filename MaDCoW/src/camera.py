@@ -14,8 +14,10 @@ Conventions:
       ``+Y`` down, ``+Z`` forward along the optical axis.
     * In pinhole mode, the horizontal FOV ``cfg.fov_deg`` determines the
       focal length in pixels via ``f = (width / 2) / tan(fov_rad / 2)``.
-    * Panorama-view mode maps cropped equirectangular view pixels back to the
-      source panorama angles recorded in the v2 annotation metadata.
+    * Panorama-view mode maps cropped equirectangular view pixels to local
+      equirectangular view angles around the crop center. The panorama center
+      is used when the annotation view is rendered, so the MaDCoW camera must
+      not apply that center rotation again.
     * View-sphere directions ``(lambda, phi)`` are yaw / pitch in radians:
       ``lambda = atan2(X_cam, Z_cam)`` and
       ``phi = atan2(Y_cam, sqrt(X_cam^2 + Z_cam^2))``. With this convention
@@ -27,13 +29,6 @@ from __future__ import annotations
 import math
 
 import numpy as np
-
-from annotation_gui.panorama import (
-    angles_to_equirect_pixel,
-    equirect_pixel_to_angles,
-    local_to_world_angles,
-    world_to_local_angles,
-)
 
 from . import Array, CameraConfig
 
@@ -170,7 +165,13 @@ class _PinholeCamera:
 
 
 class _PanoramaViewCamera:
-    """Cropped centered equirectangular panorama view from v2 annotations."""
+    """Cropped centered equirectangular panorama view from v2 annotations.
+
+    The derived image has already been rendered around ``center_yaw_rad`` and
+    ``center_pitch_rad``. Downstream MaDCoW optimization should therefore see
+    the crop's own local view sphere, with the crop center as the optical axis,
+    not the source panorama's world sphere.
+    """
 
     def __init__(self, cfg: CameraConfig) -> None:
         """Initialize a panorama-derived crop camera from annotation metadata."""
@@ -199,30 +200,32 @@ class _PanoramaViewCamera:
             )
         self.crop_x0 = float(crop[0])
         self.crop_y0 = float(crop[1])
+        self.crop_x1 = float(crop[2])
+        self.crop_y1 = float(crop[3])
+        self.crop_cx = 0.5 * (self.crop_x0 + self.crop_x1 - 1.0)
+        self.crop_cy = 0.5 * (self.crop_y0 + self.crop_y1 - 1.0)
         self.center_lam = float(view.get("center_yaw_rad", 0.0))
         self.center_phi = float(view.get("center_pitch_rad", 0.0))
         self.cx: float = (cfg.width - 1) / 2.0
         self.cy: float = (cfg.height - 1) / 2.0
         self.focal_length: None = None
+        self._lam_per_px = (2.0 * math.pi) / float(self.source_width - 1)
+        self._phi_per_px = math.pi / float(self.source_height - 1)
 
     def pixel_to_direction(self, x: Array, y: Array) -> tuple[Array, Array]:
-        """Convert view-crop pixels to world panorama yaw/pitch directions."""
+        """Convert view-crop pixels to local view yaw/pitch directions."""
         x_arr = np.asarray(x, dtype=np.float64)
         y_arr = np.asarray(y, dtype=np.float64)
         setup_x = x_arr + self.crop_x0
         setup_y = y_arr + self.crop_y0
-        local_lam, local_phi = equirect_pixel_to_angles(setup_x, setup_y, self.source_width, self.source_height)
-        return local_to_world_angles(local_lam, local_phi, self.center_lam, self.center_phi)
+        lam = (setup_x - self.crop_cx) * self._lam_per_px
+        phi = (setup_y - self.crop_cy) * self._phi_per_px
+        return lam, phi
 
     def direction_to_pixel(self, lam: Array, phi: Array) -> tuple[Array, Array]:
-        """Project world panorama yaw/pitch directions to view-crop pixels."""
-        local_lam, local_phi = world_to_local_angles(
-            np.asarray(lam, dtype=np.float64),
-            np.asarray(phi, dtype=np.float64),
-            self.center_lam,
-            self.center_phi,
-        )
-        setup_x, setup_y = angles_to_equirect_pixel(local_lam, local_phi, self.source_width, self.source_height)
+        """Project local view yaw/pitch directions to view-crop pixels."""
+        setup_x = (np.asarray(lam, dtype=np.float64) / self._lam_per_px) + self.crop_cx
+        setup_y = (np.asarray(phi, dtype=np.float64) / self._phi_per_px) + self.crop_cy
         return setup_x - self.crop_x0, setup_y - self.crop_y0
 
     def direction_in_fov(self, lam: Array, phi: Array) -> Array:
@@ -322,3 +325,35 @@ if __name__ == "__main__":
         float(np.max(np.abs(y_back - y_grid))),
     )
     print("full panorama-view all inside?:", bool(pano_camera.direction_in_fov(lam, phi).all()))
+
+    shifted_panorama_view = {
+        "projection": "equirectangular_crop",
+        "source_size": [400, 200],
+        "crop_original_px": [40.0, 20.0, 340.0, 160.0],
+        "center_yaw_rad": 0.9,
+        "center_pitch_rad": -0.35,
+    }
+    shifted_cfg = CameraConfig(
+        fov_deg=None,
+        width=300,
+        height=140,
+        model="panorama_view",
+        view=shifted_panorama_view,
+    )
+    shifted_camera = Camera(shifted_cfg)
+    xs = np.arange(shifted_cfg.width)
+    ys = np.arange(shifted_cfg.height)
+    x_grid, y_grid = np.meshgrid(xs, ys, indexing="xy")
+    lam_shifted, phi_shifted = shifted_camera.pixel_to_direction(x_grid, y_grid)
+    expected_lam = (x_grid - ((shifted_cfg.width - 1) / 2.0)) * ((2.0 * math.pi) / 399.0)
+    expected_phi = (y_grid - ((shifted_cfg.height - 1) / 2.0)) * (math.pi / 199.0)
+    x_back, y_back = shifted_camera.direction_to_pixel(lam_shifted, phi_shifted)
+    print(
+        "shifted panorama-view uses crop-centered local angles?:",
+        bool(np.allclose(lam_shifted, expected_lam) and np.allclose(phi_shifted, expected_phi)),
+    )
+    print(
+        "shifted panorama-view round-trip max err:",
+        float(np.max(np.abs(x_back - x_grid))),
+        float(np.max(np.abs(y_back - y_grid))),
+    )
