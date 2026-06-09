@@ -10,6 +10,7 @@ six-parameter objective is minimized with damped Newton iterations.
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 
 import numpy as np
 import torch
@@ -233,60 +234,65 @@ def _optimize_region_newton(
     p_stereo: Tensor,
     max_iter: int,
     valid_mask: Tensor | None = None,
+    progress_callback: Callable[[int], None] | None = None,
 ) -> Tensor:
     """Minimize Stage 1 ``E_c`` with damped Newton iterations."""
     params = params_init.detach().clone()
     best_params = params.detach().clone()
     best_loss = _stage1_value(params, mesh, region_mask, boundary_mask, weights, p_stereo, valid_mask)
 
-    for _ in range(max_iter):
-        objective_value, grad, hessian = _stage1_value_grad_hessian(
-            params,
-            mesh,
-            region_mask,
-            boundary_mask,
-            weights,
-            p_stereo,
-            valid_mask,
-        )
-        if not bool(torch.isfinite(objective_value) and torch.isfinite(grad).all() and torch.isfinite(hessian).all()):
-            break
+    for iteration in range(max_iter):
+        try:
+            objective_value, grad, hessian = _stage1_value_grad_hessian(
+                params,
+                mesh,
+                region_mask,
+                boundary_mask,
+                weights,
+                p_stereo,
+                valid_mask,
+            )
+            if not bool(torch.isfinite(objective_value) and torch.isfinite(grad).all() and torch.isfinite(hessian).all()):
+                break
 
-        if bool(objective_value < best_loss):
-            best_loss = objective_value.detach()
-            best_params = params.detach().clone()
+            if bool(objective_value < best_loss):
+                best_loss = objective_value.detach()
+                best_params = params.detach().clone()
 
-        grad_norm = torch.linalg.norm(grad)
-        if bool(grad_norm <= _NEWTON_GRAD_TOL):
-            break
+            grad_norm = torch.linalg.norm(grad)
+            if bool(grad_norm <= _NEWTON_GRAD_TOL):
+                break
 
-        direction = _newton_direction(grad, hessian)
-        if direction is None:
-            break
+            direction = _newton_direction(grad, hessian)
+            if direction is None:
+                break
 
-        accepted = _backtracking_line_search(
-            params,
-            direction,
-            objective_value,
-            grad,
-            mesh,
-            region_mask,
-            boundary_mask,
-            weights,
-            p_stereo,
-            valid_mask,
-        )
-        if accepted is None:
-            break
+            accepted = _backtracking_line_search(
+                params,
+                direction,
+                objective_value,
+                grad,
+                mesh,
+                region_mask,
+                boundary_mask,
+                weights,
+                p_stereo,
+                valid_mask,
+            )
+            if accepted is None:
+                break
 
-        next_params, next_loss = accepted
-        step_norm = torch.linalg.norm(next_params - params)
-        params = next_params
-        if bool(next_loss < best_loss):
-            best_loss = next_loss.detach()
-            best_params = params.detach().clone()
-        if bool(step_norm <= _NEWTON_STEP_TOL * (1.0 + torch.linalg.norm(params))):
-            break
+            next_params, next_loss = accepted
+            step_norm = torch.linalg.norm(next_params - params)
+            params = next_params
+            if bool(next_loss < best_loss):
+                best_loss = next_loss.detach()
+                best_params = params.detach().clone()
+            if bool(step_norm <= _NEWTON_STEP_TOL * (1.0 + torch.linalg.norm(params))):
+                break
+        finally:
+            if progress_callback is not None:
+                progress_callback(iteration + 1)
 
     return best_params.detach().clone()
 
@@ -335,6 +341,7 @@ def optimize_region(
     p_stereo: Tensor,
     max_iter: int,
     valid_mask: Array | Tensor | None = None,
+    progress_callback: Callable[[int], None] | None = None,
 ) -> tuple[Tensor, Tensor]:
     """Optimize the six-parameter projection ``T_k`` for one ROI.
 
@@ -352,6 +359,8 @@ def optimize_region(
         valid_mask: Optional boolean mesh mask for vertices supported by the
             input FOV. The ROI and boundary conformal loss are restricted to
             this valid domain.
+        progress_callback: Optional callback receiving completed Newton
+            iteration count for GUI progress reporting.
 
     Returns:
         Tuple ``(params, t_evaluated)``:
@@ -406,6 +415,7 @@ def optimize_region(
         p_stereo=p_ref,
         max_iter=max_iter,
         valid_mask=valid_t,
+        progress_callback=progress_callback,
     )
     t_final = _evaluate_region_projection(mesh, params_final).detach()
     return params_final, t_final

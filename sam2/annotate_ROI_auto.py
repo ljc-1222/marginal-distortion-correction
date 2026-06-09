@@ -25,6 +25,7 @@ from annotation_gui import AnnotationSession, load_image_view
 from annotation_gui.base import (
     EmbeddedViewSetupController,
     add_button_row,
+    add_styled_button,
     clear_widget_axes,
     create_image_figure,
     set_image_artist,
@@ -314,6 +315,7 @@ class SAM2ROIAnnotationGUI:
         widgets: list[Any] | None = None,
         on_complete: Any | None = None,
         save_close_label: str = "Save+Close",
+        control_layout: str = "bottom",
     ) -> None:
         if start_with_setup and initial_session is not None:
             raise ValueError("start_with_setup cannot be used with initial_session.")
@@ -368,6 +370,7 @@ class SAM2ROIAnnotationGUI:
         self.json_path = Path(json_path).resolve() if json_path is not None else self.output_dir / f"{Path(self.image_path).stem}.json"
         self.on_complete = on_complete
         self.save_close_label = save_close_label
+        self.control_layout = control_layout
         self._connection_ids: list[int] = []
 
         if fig is None:
@@ -404,6 +407,7 @@ class SAM2ROIAnnotationGUI:
         widgets: list[Any] | None = None,
         on_complete: Any | None = None,
         save_close_label: str = "Save+Close",
+        control_layout: str = "bottom",
     ) -> "SAM2ROIAnnotationGUI":
         """Create an ROI GUI that starts directly from a prepared annotation session."""
         if session.fov_deg is None:
@@ -428,6 +432,7 @@ class SAM2ROIAnnotationGUI:
             widgets=widgets,
             on_complete=on_complete,
             save_close_label=save_close_label,
+            control_layout=control_layout,
         )
 
     def _build_figure(self) -> None:
@@ -507,6 +512,35 @@ class SAM2ROIAnnotationGUI:
     def _set_roi_controls(self) -> None:
         """Show append-only ROI prompt controls."""
         self._clear_controls()
+        if self.control_layout == "sidebar":
+            add_styled_button(
+                self.fig,
+                self.widgets,
+                "Box",
+                (0.04, 0.36, 0.14, 0.045),
+                self._button_box,
+                selected=self.mode == "box",
+            )
+            add_styled_button(
+                self.fig,
+                self.widgets,
+                "Point",
+                (0.20, 0.36, 0.14, 0.045),
+                self._button_point,
+                selected=self.mode == "point",
+            )
+            add_styled_button(self.fig, self.widgets, "Redraw", (0.04, 0.29, 0.14, 0.045), self._button_redraw_region)
+            add_styled_button(self.fig, self.widgets, "Next ROI", (0.20, 0.29, 0.14, 0.045), self._button_next_region)
+            add_styled_button(self.fig, self.widgets, "Save", (0.04, 0.235, 0.14, 0.045), self._button_save)
+            add_styled_button(
+                self.fig,
+                self.widgets,
+                self.save_close_label,
+                (0.20, 0.235, 0.14, 0.045),
+                self._button_save_close,
+                primary=True,
+            )
+            return
         buttons = [
             ("Box", 0.075, self._button_box),
             ("Point", 0.085, self._button_point),
@@ -619,6 +653,8 @@ class SAM2ROIAnnotationGUI:
         self._dragging_box = False
         self._box_start = None
         self._box_preview = None
+        if self.control_layout == "sidebar":
+            self._set_roi_controls()
         self.message = f"Accepted ROI {accepted_idx}. Draw the next ROI draft."
         self._refresh()
 
@@ -657,6 +693,8 @@ class SAM2ROIAnnotationGUI:
         self._dragging_box = False
         self._box_start = None
         self._box_preview = None
+        if self.control_layout == "sidebar":
+            self._set_roi_controls()
         self._refresh()
 
     def _clip_xy(self, x: float, y: float) -> tuple[float, float]:

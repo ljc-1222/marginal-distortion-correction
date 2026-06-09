@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import json
 import numbers
+from collections.abc import Callable
 from pathlib import Path
 
 import numpy as np
@@ -34,6 +35,13 @@ from .src.weights import compute_weights
 
 LINE_ANNOTATION_POINTS = 128
 SUPPORTED_ANNOTATION_CAMERA_MODELS = {"pinhole", "panorama_view"}
+ProgressCallback = Callable[[dict[str, object]], None]
+
+
+def _emit_progress(progress_callback: ProgressCallback | None, **event: object) -> None:
+    """Emit a progress event when a GUI callback is attached."""
+    if progress_callback is not None:
+        progress_callback(event)
 
 
 def _resolve_path(path: str, base_dir: Path) -> str:
@@ -238,7 +246,7 @@ def resolve_pipeline_image_path(image_arg: str | None, annotations: AnnotationDa
     return image_path
 
 
-def run_pipeline(args: argparse.Namespace) -> None:
+def run_pipeline(args: argparse.Namespace, progress_callback: ProgressCallback | None = None) -> None:
     """Execute the full MaDCoW pipeline end to end.
 
     Steps:
@@ -257,6 +265,7 @@ def run_pipeline(args: argparse.Namespace) -> None:
 
     Args:
         args: Parsed CLI arguments from :func:`parse_args`.
+        progress_callback: Optional callback for GUI progress events.
     """
     cfg = load_config(args.config)
     annotations = load_annotations(args.annotations)
@@ -286,11 +295,46 @@ def run_pipeline(args: argparse.Namespace) -> None:
 
     region_masks_np: list[np.ndarray] = []
     t_per_region: list[torch.Tensor] = []
-    for region in annotations.regions:
+    stage1_segment = max(1, int(cfg.stage1_max_iter))
+    stage1_total = max(1, len(annotations.regions) * stage1_segment)
+    _emit_progress(
+        progress_callback,
+        stage="stage1",
+        phase="start",
+        current=0,
+        total=stage1_total,
+        message="Starting Stage 1 ROI optimization.",
+    )
+    if not annotations.regions:
+        _emit_progress(
+            progress_callback,
+            stage="stage1",
+            phase="done",
+            current=stage1_total,
+            total=stage1_total,
+            message="Stage 1 complete: no ROI regions.",
+        )
+
+    for region_index, region in enumerate(annotations.regions):
         mask_img = _read_mask(region.mask_path, (H_img, W_img))
         mask_mesh = rasterize_mask_to_mesh(mask_img, camera, mesh) & valid_mesh_mask_np
         if not bool(mask_mesh.any()):
             raise ValueError(f"region {region.name!r} does not cover any valid mesh vertex.")
+
+        def on_stage1_iteration(iteration: int, region_index: int = region_index) -> None:
+            current = region_index * stage1_segment + min(int(iteration), stage1_segment)
+            _emit_progress(
+                progress_callback,
+                stage="stage1",
+                phase="update",
+                current=min(current, stage1_total),
+                total=stage1_total,
+                region_index=region_index + 1,
+                region_count=len(annotations.regions),
+                iteration=min(int(iteration), stage1_segment),
+                max_iter=stage1_segment,
+                message=f"Stage 1 ROI {region_index + 1}/{len(annotations.regions)}.",
+            )
 
         _, t_eval = optimize_region(
             mesh=mesh,
@@ -299,9 +343,31 @@ def run_pipeline(args: argparse.Namespace) -> None:
             p_stereo=p_stereo,
             max_iter=cfg.stage1_max_iter,
             valid_mask=valid_mesh_mask_np,
+            progress_callback=on_stage1_iteration,
+        )
+        _emit_progress(
+            progress_callback,
+            stage="stage1",
+            phase="update",
+            current=min((region_index + 1) * stage1_segment, stage1_total),
+            total=stage1_total,
+            region_index=region_index + 1,
+            region_count=len(annotations.regions),
+            iteration=stage1_segment,
+            max_iter=stage1_segment,
+            message=f"Stage 1 ROI {region_index + 1}/{len(annotations.regions)} complete.",
         )
         region_masks_np.append(mask_mesh)
         t_per_region.append(t_eval)
+    if annotations.regions:
+        _emit_progress(
+            progress_callback,
+            stage="stage1",
+            phase="done",
+            current=stage1_total,
+            total=stage1_total,
+            message="Stage 1 complete.",
+        )
 
     if t_per_region:
         t_targets = torch.stack(t_per_region, dim=0).to(dtype=p_stereo.dtype, device=p_stereo.device)
@@ -317,6 +383,30 @@ def run_pipeline(args: argparse.Namespace) -> None:
         mesh=mesh,
         blend_c=cfg.blend_c,
     )
+    stage2_eval_budget = max(1, int(cfg.stage2_max_iter) * 5 // 4)
+    stage2_total = stage2_eval_budget + 1
+    _emit_progress(
+        progress_callback,
+        stage="stage2",
+        phase="start",
+        current=0,
+        total=stage2_total,
+        message="Starting Stage 2 warp optimization.",
+    )
+
+    def on_stage2_iteration(iteration: int) -> None:
+        current = min(max(1, int(iteration)), stage2_eval_budget)
+        _emit_progress(
+            progress_callback,
+            stage="stage2",
+            phase="update",
+            current=current,
+            total=stage2_total,
+            iteration=int(iteration),
+            max_iter=stage2_eval_budget,
+            message="Stage 2 warp optimization running.",
+        )
+
     p_final = optimize_warp(
         p_init=p_init,
         mesh=mesh,
@@ -326,8 +416,26 @@ def run_pipeline(args: argparse.Namespace) -> None:
         region_masks=region_masks,
         cfg=cfg,
         valid_mask=torch.as_tensor(valid_mesh_mask_np, dtype=torch.bool, device=p_init.device),
+        progress_callback=on_stage2_iteration,
+    )
+    _emit_progress(
+        progress_callback,
+        stage="stage2",
+        phase="done",
+        current=stage2_total,
+        total=stage2_total,
+        message="Stage 2 complete.",
     )
 
+    finalize_total = 3
+    _emit_progress(
+        progress_callback,
+        stage="finalize",
+        phase="start",
+        current=0,
+        total=finalize_total,
+        message="Rendering corrected output.",
+    )
     if args.crop:
         output, valid_mask = warp_image(
             image,
@@ -337,6 +445,14 @@ def run_pipeline(args: argparse.Namespace) -> None:
             out_size=(H_img, W_img),
             return_mask=True,
             valid_mesh_mask=valid_mesh_mask_np,
+        )
+        _emit_progress(
+            progress_callback,
+            stage="finalize",
+            phase="update",
+            current=1,
+            total=finalize_total,
+            message="Cropping corrected output.",
         )
         output = crop_to_rect(output, valid_mask, target_aspect=(W_img, H_img))
     else:
@@ -348,7 +464,23 @@ def run_pipeline(args: argparse.Namespace) -> None:
             out_size=(H_img, W_img),
             valid_mesh_mask=valid_mesh_mask_np,
         )
+    _emit_progress(
+        progress_callback,
+        stage="finalize",
+        phase="update",
+        current=2,
+        total=finalize_total,
+        message="Saving corrected output.",
+    )
     _save_image(args.output, output)
+    _emit_progress(
+        progress_callback,
+        stage="finalize",
+        phase="done",
+        current=finalize_total,
+        total=finalize_total,
+        message="Corrected output saved.",
+    )
 
 
 if __name__ == "__main__":

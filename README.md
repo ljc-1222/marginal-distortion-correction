@@ -22,7 +22,7 @@ metadata and merged afterward.
   samples.
 - `MaDCoW/` contains the marginal distortion correction pipeline and the
   original `MaDCoW.main` CLI.
-- `pipeline/` contains the top-level integration controller and the fallback
+- `pipeline/` contains top-level GUI integration helpers and the fallback
   annotation merge utility.
 - `annotate.py` runs the integrated annotation workflow.
 - `run_mad.py` runs MaDCoW on a complete annotation JSON.
@@ -32,12 +32,16 @@ metadata and merged afterward.
 ```text
 input image
   -> annotate.py
-     -> shared camera/view setup
+     -> integrated annotation GUI
+        -> choose image from data folder with preview
+        -> confirm output directory
+        -> choose one SAM2 model
+        -> shared camera/view setup
         -> pinhole: edit horizontal FOV, then Done
         -> panorama: choose center and crop range, then Done
-     -> SAM2 ROI annotation on the active annotation image
-     -> interactive snapping line annotation on the same active annotation image
-     -> complete MaDCoW-compatible annotation JSON
+        -> SAM2 ROI annotation on the active annotation image
+        -> interactive snapping line annotation on the same active annotation image
+        -> complete MaDCoW-compatible annotation JSON
   -> run_mad.py
      -> MaDCoW correction
      -> corrected output image
@@ -82,38 +86,60 @@ sam2/checkpoints/sam2.1_hiera_base_plus.pt
 sam2/checkpoints/sam2.1_hiera_large.pt
 ```
 
-The quick-start command below uses the large checkpoint.
+The integrated GUI exposes these SAM2.1 model choices:
+
+| Model | Checkpoint | Notes |
+| --- | --- | --- |
+| Tiny | `sam2/checkpoints/sam2.1_hiera_tiny.pt` | Fastest, lowest memory, lowest mask quality. |
+| Small | `sam2/checkpoints/sam2.1_hiera_small.pt` | Fast with moderate memory use. |
+| Base Plus | `sam2/checkpoints/sam2.1_hiera_base_plus.pt` | Balanced quality and speed. |
+| Large | `sam2/checkpoints/sam2.1_hiera_large.pt` | Best mask quality, highest memory use. |
+
+If a checkpoint is missing, its model option is shown as unavailable.
 
 ## Quick Start
-
-Create a workspace directory for generated masks, panorama views, intermediate
-annotation files, logs, and the final annotation JSON.
-
-```bash
-mkdir -p data/example_workspace
-```
 
 Create one complete annotation JSON:
 
 ```bash
-python annotate.py \
-    --image data/test.png
-    --workspace data/test \
-    --output-annotation data/test/annotation.json \
-    --sam2-checkpoint sam2/checkpoints/sam2.1_hiera_large.pt \
-    --sam2-model-cfg configs/sam2.1/sam2.1_hiera_l.yaml \
-    --device auto \
-    --snap-config interactive_snapping_2d/config/snap_config.json
+python annotate.py
 ```
+
+The integrated GUI starts in `data/`, shows supported image files, displays a
+preview after selecting an image filename, proposes an output directory from the
+input image's parent folder name, and writes the final JSON as
+`<output_directory>/annotation.json`. For example, selecting
+`data/test1/test.png` defaults to `annotation/test1/annotation.json` unless the
+output directory is edited.
 
 Run MaDCoW correction:
 
 ```bash
+python run_mad.py
+```
+
+The runner GUI starts in `annotation/`, lets you choose a complete annotation
+JSON, proposes an output directory from the annotation image's parent folder,
+offers an editable output image name and crop toggle, shows Stage 1 and Stage 2
+optimizer progress bars plus a final render/save progress bar, and previews the
+corrected output after saving. For example, an annotation whose `image_path` is
+`data/test1/test.png` defaults to `outputs/test1/` and writes
+`test_corrected.png` or `test_corrected_crop.png`.
+
+The CLI path is still available:
+
+```bash
 python run_mad.py \
-    --annotations data/test/annotation.json \
-    --config MaDCoW/config.json \
-    --output data/test/test_corrected.png \
+    --annotations annotation/test1/annotation.json \
+    --output data/test1/test_corrected_crop.png \
     --crop
+```
+Or if you want the uncrop one:
+
+```bash
+python run_mad.py \
+    --annotations annotation/test1/annotation.json \
+    --output data/test1/test_corrected.png \
 ```
 
 For non-`panorama_view` annotations, `run_mad.py` also accepts `--image` as an
@@ -121,34 +147,44 @@ optional override if the annotation JSON does not contain the desired input
 image path. For `panorama_view` annotations, omit `--image` unless it is exactly
 the same path as the JSON `image_path`.
 
+## MaDCoW Runner GUI
+
+`run_mad.py` opens a single Matplotlib window when launched without CLI
+arguments.
+
+1. `Select Annotation`: browse from `annotation/`, click a full annotation JSON,
+   and preview the image referenced by the JSON.
+2. `Select Output`: confirm or edit the output directory, output image name,
+   and crop setting. The default output filename is derived from the annotation
+   `image_path`.
+3. `Run MaDCoW`: Stage 1 and Stage 2 progress bars update from MaDCoW optimizer
+   callbacks, then `Finalize output` tracks render, crop, and save.
+4. `Complete`: the corrected image is loaded back into the preview canvas.
+
 ## Annotation GUI Workflow
 
-The first GUI window is always the shared camera/view setup.
+`annotate.py` opens one Matplotlib window with a fixed left sidebar for the step
+counter, setup controls, and run summary. The right side stays as the preview or
+annotation canvas throughout the workflow.
 
-- `Pinhole`: preview the original image, edit horizontal FOV, then press
-  `Done`.
-- `Panorama`: drag the panorama preview to choose the view center, drag crop
-  edges to choose the annotation range, then press `Done`.
-
-After setup, SAM2 ROI annotation starts on the active annotation image.
-
-- `Box`: draw a box prompt and predict the current ROI mask.
-- `Point`: add positive point prompts and predict the current ROI mask.
-- `Redraw`: clear the current ROI draft.
-- `Next ROI`: accept the current non-empty ROI and start the next one.
-- `Save+Close`: save the ROI phase output and close the ROI window.
-
-After ROI annotation, interactive snapping starts on the same active annotation
-image.
-
-- Left-drag: draw a rough stroke near a real-world straight structure.
-- `Type`: choose `line` or `curve` if the GUI exposes both modes.
-- `Redraw`: discard the pending snapped result.
-- `Next`: accept the pending snapped result.
-- `Save+Close`: save the line phase output and close the line window.
-
-The integrated controller then writes one final annotation JSON at
-`--output-annotation` and writes `annotation_summary.json` in the workspace.
+1. `Select Image`: browse from `data/`, click an image filename, and inspect
+   the preview in the same window.
+2. `Select Output Directory`: confirm or edit the workspace. The default is
+   `annotation/<input_parent_folder>`. For `data/test1/test.png`, this is
+   `annotation/test1`, and the final JSON path is
+   `annotation/test1/annotation.json`.
+3. `Select SAM2 Model`: choose Tiny, Small, Base Plus, or Large. The GUI maps
+   the model name to its fixed checkpoint and config path.
+4. `Camera/View Setup`: choose the active annotation view. `Pinhole` previews
+   the original image and exposes editable horizontal FOV. `Panorama` lets the
+   user choose view center and crop range. Press `Done` to finalize setup.
+5. `SAM2 ROI Annotation`: use box or point prompts, `Redraw`, `Next ROI`, and
+   `Done ROI` to create ROI masks on the active annotation image.
+6. `Snapping Line Annotation`: draw rough strokes near real-world straight
+   structures, accept snapped results with `Next`, and press `Save Final`.
+7. `Save Complete Annotation`: the integrated controller writes one final
+   annotation JSON at `<output_directory>/annotation.json` and writes
+   `annotation_summary.json` in the workspace.
 
 ## Annotation JSON
 
@@ -207,6 +243,10 @@ Generated checkpoints, masks, panorama views, annotation JSON files, and
 corrected images are local assets. Do not commit large checkpoints or generated
 workspace outputs.
 
+`annotate.py` uses the fixed snapping config
+`interactive_snapping_2d/config/snap_config.json`. `run_mad.py` uses the fixed
+MaDCoW config `MaDCoW/config.json`.
+
 ## Fallback Merge Utility
 
 The normal top-level annotation path shares one camera/view setup and writes one
@@ -241,4 +281,3 @@ python -m pipeline.annotation_merge --self-check
 The merge self-check creates temporary annotation JSON files and a temporary
 mask file, verifies successful merge behavior, and verifies clear errors for
 mismatched image path, camera model, and pinhole FOV.
-

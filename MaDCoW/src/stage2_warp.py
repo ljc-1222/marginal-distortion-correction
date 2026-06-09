@@ -7,6 +7,8 @@ over the per-vertex mapping ``p_{i,j}`` using ``torch.optim.LBFGS``.
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import torch
 
 from . import LineAnnotation, MeshGrid, PipelineConfig, Tensor
@@ -92,6 +94,7 @@ def optimize_warp(
     region_masks: Tensor,
     cfg: PipelineConfig,
     valid_mask: Tensor | None = None,
+    progress_callback: Callable[[int], None] | None = None,
 ) -> Tensor:
     """Run the L-BFGS optimization for the full-image warp.
 
@@ -107,6 +110,8 @@ def optimize_warp(
         cfg: Pipeline configuration (loss weights, max iterations, lr).
         valid_mask: Optional boolean mesh mask for vertices supported by the
             input FOV. All Stage 2 loss terms are restricted to this domain.
+        progress_callback: Optional callback receiving completed L-BFGS
+            closure count for GUI progress reporting.
 
     Returns:
         Tensor of shape ``(H, W, 2)`` with the optimized per-vertex
@@ -144,9 +149,10 @@ def optimize_warp(
 
     best_loss = float("inf")
     best_p = p.detach().clone()
+    progress_count = 0
 
     def closure() -> Tensor:
-        nonlocal best_loss, best_p
+        nonlocal best_loss, best_p, progress_count
         optimizer.zero_grad()
         objective = _stage2_objective(p, mesh, weights_t, lines, targets_t, masks_t, cfg, valid_t)
         if torch.isfinite(objective):
@@ -155,6 +161,9 @@ def optimize_warp(
                 best_loss = loss_value
                 best_p = p.detach().clone()
         objective.backward()
+        progress_count += 1
+        if progress_callback is not None:
+            progress_callback(progress_count)
         return objective
 
     try:

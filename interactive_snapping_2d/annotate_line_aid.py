@@ -13,7 +13,14 @@ import numpy as np
 from PIL import ExifTags, Image
 
 from annotation_gui import AnnotationSession, render_centered_equirectangular
-from annotation_gui.base import add_button_row, add_text_box, clear_widget_axes, create_image_figure, set_image_artist
+from annotation_gui.base import (
+    add_button_row,
+    add_styled_button,
+    add_text_box,
+    clear_widget_axes,
+    create_image_figure,
+    set_image_artist,
+)
 from annotation_gui.io import build_annotation_payload, write_annotation_json
 
 from .snap2d import SnapConfig, SnapResult, load_snap_config, snap_annotation
@@ -277,6 +284,7 @@ class LineAidAnnotationGUI:
         on_complete: Any | None = None,
         save_close_label: str = "Save+Close",
         allow_empty_annotations: bool = False,
+        control_layout: str = "bottom",
     ) -> None:
         external_items = (fig, ax, image_artist, status, help_text)
         if any(item is not None for item in external_items) and not all(item is not None for item in external_items):
@@ -329,6 +337,7 @@ class LineAidAnnotationGUI:
         self.on_complete = on_complete
         self.save_close_label = save_close_label
         self.allow_empty_annotations = bool(allow_empty_annotations)
+        self.control_layout = control_layout
         self._connection_ids: list[int] = []
 
         stem = Path(self.image_path).stem
@@ -365,6 +374,7 @@ class LineAidAnnotationGUI:
         on_complete: Any | None = None,
         save_close_label: str = "Save+Close",
         allow_empty_annotations: bool = False,
+        control_layout: str = "bottom",
     ) -> "LineAidAnnotationGUI":
         """Create a line snapping GUI that starts from a prepared annotation session."""
         return cls(
@@ -383,6 +393,7 @@ class LineAidAnnotationGUI:
             on_complete=on_complete,
             save_close_label=save_close_label,
             allow_empty_annotations=allow_empty_annotations,
+            control_layout=control_layout,
         )
 
     def _build_figure(self) -> None:
@@ -458,6 +469,53 @@ class LineAidAnnotationGUI:
         from matplotlib.widgets import RadioButtons
 
         self._clear_controls()
+        if self.control_layout == "sidebar":
+            self._buttons["line"] = add_styled_button(
+                self.fig,
+                self.widgets,
+                "Line",
+                (0.04, 0.36, 0.14, 0.045),
+                lambda _event: self._on_snap_mode_changed("line"),
+                selected=self.snap_mode == "line",
+            )
+            self._buttons["curve"] = add_styled_button(
+                self.fig,
+                self.widgets,
+                "Curve",
+                (0.20, 0.36, 0.14, 0.045),
+                lambda _event: self._on_snap_mode_changed("curve"),
+                selected=self.snap_mode == "curve",
+            )
+            self._buttons["redraw"] = add_styled_button(
+                self.fig,
+                self.widgets,
+                "Redraw",
+                (0.04, 0.29, 0.14, 0.045),
+                self._button_redraw,
+            )
+            self._buttons["next"] = add_styled_button(
+                self.fig,
+                self.widgets,
+                "Next",
+                (0.20, 0.29, 0.14, 0.045),
+                self._button_next,
+            )
+            self._buttons["save"] = add_styled_button(
+                self.fig,
+                self.widgets,
+                "Save",
+                (0.04, 0.235, 0.14, 0.045),
+                self._button_save,
+            )
+            self._buttons["save_close"] = add_styled_button(
+                self.fig,
+                self.widgets,
+                self.save_close_label,
+                (0.20, 0.235, 0.14, 0.045),
+                self._button_save_close,
+                primary=True,
+            )
+            return
         mode_ax = self.fig.add_axes([0.04, 0.035, 0.14, 0.12])
         mode_ax.set_title("Type", fontsize=9)
         active_mode = SNAP_MODE_CHOICES.index(self.snap_mode)
@@ -753,6 +811,8 @@ class LineAidAnnotationGUI:
         self.snap_mode = label
         if self.state != STATE_ANNOTATE:
             return
+        if self.control_layout == "sidebar":
+            self._set_annotation_controls()
         if self.pending is not None:
             self._resnap_pending()
         else:

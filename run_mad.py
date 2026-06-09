@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
+
+
+MADCOW_CONFIG_PATH = "MaDCoW/config.json"
 
 
 def parse_args() -> argparse.Namespace:
@@ -12,7 +16,6 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run MaDCoW correction on a full annotation JSON.")
     parser.add_argument("--image", default=None, help="Optional input image override.")
     parser.add_argument("--annotations", required=True, help="Full MaDCoW annotation JSON path.")
-    parser.add_argument("--config", default="MaDCoW/config.json", help="MaDCoW pipeline config JSON path.")
     parser.add_argument("--output", required=True, help="Corrected output image path.")
     parser.add_argument(
         "--crop",
@@ -49,7 +52,15 @@ def _write_summary(args: argparse.Namespace) -> None:
 
 def main() -> None:
     """CLI entry point."""
+    if len(sys.argv) == 1:
+        from pipeline.madcow_runner_gui import MaDCoWRunnerConfig, run_madcow_gui
+
+        output = run_madcow_gui(MaDCoWRunnerConfig(config=MADCOW_CONFIG_PATH))
+        print(f"Saved MaDCoW corrected image: {output}")
+        return
+
     args = parse_args()
+    args.config = MADCOW_CONFIG_PATH
     from MaDCoW.main import run_pipeline
 
     run_pipeline(args)
@@ -59,4 +70,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
