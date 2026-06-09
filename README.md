@@ -115,6 +115,20 @@ output directory is edited.
 Run MaDCoW correction:
 
 ```bash
+python run_mad.py
+```
+
+The runner GUI starts in `annotation/`, lets you choose a complete annotation
+JSON, proposes an output directory from the annotation image's parent folder,
+offers an editable output image name and crop toggle, shows Stage 1 and Stage 2
+optimizer progress bars plus a final render/save progress bar, and previews the
+corrected output after saving. For example, an annotation whose `image_path` is
+`data/test1/test.png` defaults to `outputs/test1/` and writes
+`test_corrected.png` or `test_corrected_crop.png`.
+
+The CLI path is still available:
+
+```bash
 python run_mad.py \
     --annotations annotation/test1/annotation.json \
     --output data/test1/test_corrected_crop.png \
@@ -132,6 +146,20 @@ For non-`panorama_view` annotations, `run_mad.py` also accepts `--image` as an
 optional override if the annotation JSON does not contain the desired input
 image path. For `panorama_view` annotations, omit `--image` unless it is exactly
 the same path as the JSON `image_path`.
+
+## MaDCoW Runner GUI
+
+`run_mad.py` opens a single Matplotlib window when launched without CLI
+arguments.
+
+1. `Select Annotation`: browse from `annotation/`, click a full annotation JSON,
+   and preview the image referenced by the JSON.
+2. `Select Output`: confirm or edit the output directory, output image name,
+   and crop setting. The default output filename is derived from the annotation
+   `image_path`.
+3. `Run MaDCoW`: Stage 1 and Stage 2 progress bars update from MaDCoW optimizer
+   callbacks, then `Finalize output` tracks render, crop, and save.
+4. `Complete`: the corrected image is loaded back into the preview canvas.
 
 ## Annotation GUI Workflow
 

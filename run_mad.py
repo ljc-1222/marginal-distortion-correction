@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
 
@@ -51,6 +52,13 @@ def _write_summary(args: argparse.Namespace) -> None:
 
 def main() -> None:
     """CLI entry point."""
+    if len(sys.argv) == 1:
+        from pipeline.madcow_runner_gui import MaDCoWRunnerConfig, run_madcow_gui
+
+        output = run_madcow_gui(MaDCoWRunnerConfig(config=MADCOW_CONFIG_PATH))
+        print(f"Saved MaDCoW corrected image: {output}")
+        return
+
     args = parse_args()
     args.config = MADCOW_CONFIG_PATH
     from MaDCoW.main import run_pipeline
