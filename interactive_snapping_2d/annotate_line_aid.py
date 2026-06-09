@@ -14,6 +14,7 @@ from PIL import ExifTags, Image
 
 from annotation_gui import AnnotationSession, render_centered_equirectangular
 from annotation_gui.base import add_button_row, add_text_box, clear_widget_axes, create_image_figure, set_image_artist
+from annotation_gui.io import build_annotation_payload, write_annotation_json
 
 from .snap2d import SnapConfig, SnapResult, load_snap_config, snap_annotation
 from .snap2d.io import result_to_madcow_annotation_dict, save_madcow_annotation_json
@@ -275,6 +276,7 @@ class LineAidAnnotationGUI:
         widgets: list[Any] | None = None,
         on_complete: Any | None = None,
         save_close_label: str = "Save+Close",
+        allow_empty_annotations: bool = False,
     ) -> None:
         external_items = (fig, ax, image_artist, status, help_text)
         if any(item is not None for item in external_items) and not all(item is not None for item in external_items):
@@ -326,6 +328,7 @@ class LineAidAnnotationGUI:
         self.annotation_crop_origin = (0.0, 0.0)
         self.on_complete = on_complete
         self.save_close_label = save_close_label
+        self.allow_empty_annotations = bool(allow_empty_annotations)
         self._connection_ids: list[int] = []
 
         stem = Path(self.image_path).stem
@@ -361,6 +364,7 @@ class LineAidAnnotationGUI:
         widgets: list[Any] | None = None,
         on_complete: Any | None = None,
         save_close_label: str = "Save+Close",
+        allow_empty_annotations: bool = False,
     ) -> "LineAidAnnotationGUI":
         """Create a line snapping GUI that starts from a prepared annotation session."""
         return cls(
@@ -378,6 +382,7 @@ class LineAidAnnotationGUI:
             widgets=widgets,
             on_complete=on_complete,
             save_close_label=save_close_label,
+            allow_empty_annotations=allow_empty_annotations,
         )
 
     def _build_figure(self) -> None:
@@ -1139,8 +1144,11 @@ class LineAidAnnotationGUI:
         """Return MaDCoW ``lines[]`` entries for accepted snapped results."""
         if self.pending is not None:
             self._accept_pending()
+        results = self._results_for_save()
+        if not results:
+            return []
         payload = result_to_madcow_annotation_dict(
-            self._results_for_save(),
+            results,
             self.session.image_path,
             str(output_path),
             image_shape=(self.session.height, self.session.width),
@@ -1161,8 +1169,27 @@ class LineAidAnnotationGUI:
 
         results = self._results_for_save()
         if not results:
-            self.status_extra = "Nothing to save. Draw at least one annotation first."
-            return False
+            if not self.allow_empty_annotations:
+                self.status_extra = "Nothing to save. Draw at least one annotation first."
+                return False
+            madcow_status = "MaDCoW JSON written"
+            camera_model = "panorama_view" if str(self.camera_type) == "panorama" else str(self.camera_type)
+            try:
+                payload = build_annotation_payload(
+                    image_path=self.session.image_path,
+                    output_path=self.json_path,
+                    source_image_path=self.session.source_image_path if self.session.view_metadata is not None else None,
+                    camera_model=camera_model,
+                    fov_deg=self.fov_deg if camera_model == "pinhole" else None,
+                    view_metadata=self.session.view_metadata,
+                    lines=[],
+                    regions=[],
+                )
+                write_annotation_json(self.json_path, payload)
+            except Exception as exc:
+                madcow_status = f"MaDCoW JSON not written: {exc}"
+            self.status_extra = f"Saved 0 annotation(s). {madcow_status}: {self.json_path}."
+            return True
 
         madcow_status = "MaDCoW JSON written"
         try:

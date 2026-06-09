@@ -208,6 +208,7 @@ class IntegratedAnnotationGUI:
             widgets=self.widgets,
             on_complete=self._on_line_done,
             save_close_label="Save Final",
+            allow_empty_annotations=True,
         )
 
     def _on_line_done(self, line_gui: LineAidAnnotationGUI) -> None:
