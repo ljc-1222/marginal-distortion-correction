@@ -112,7 +112,7 @@ Run MaDCoW correction:
 python run_mad.py \
     --annotations data/test/annotation.json \
     --config MaDCoW/config.json \
-    --output data/example_workspace/test_corrected.png \
+    --output data/test/test_corrected.png \
     --crop
 ```
 
