@@ -54,6 +54,12 @@ def clear_widget_axes(widgets: list[Any]) -> None:
     """Remove all widget axes in a shared control panel."""
     seen_axes: set[int] = set()
     for widget in list(widgets):
+        disconnect = getattr(widget, "disconnect_events", None)
+        if callable(disconnect):
+            try:
+                disconnect()
+            except (AttributeError, ValueError):
+                pass
         ax = getattr(widget, "ax", None)
         if ax is None:
             continue
@@ -87,7 +93,7 @@ def add_button_row(
     created: list[Any] = []
     for label, width, callback in buttons:
         ax_button = fig.add_axes([x0, y0, width, height])
-        button = Button(ax_button, label)
+        button = Button(ax_button, label, color="#f7f7f7", hovercolor="#e6eef8")
         button.on_clicked(callback)
         widgets.append(button)
         created.append(button)
