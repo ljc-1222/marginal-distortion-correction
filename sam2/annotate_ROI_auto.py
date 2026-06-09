@@ -19,6 +19,7 @@ from typing import Any, Iterator
 
 import numpy as np
 from PIL import ExifTags, Image
+from scipy.ndimage import binary_fill_holes, label
 
 from annotation_gui import AnnotationSession, load_image_view
 from annotation_gui.base import (
@@ -38,6 +39,7 @@ DEFAULT_CHECKPOINT = SAM2_ROOT / "checkpoints" / "sam2.1_hiera_large.pt"
 DEFAULT_MODEL_CFG = "configs/sam2.1/sam2.1_hiera_l.yaml"
 FALLBACK_FOV_DEG = 90.0
 PREVIEW_MAX_SIDE = 1200
+ROI_AREA_RATIO_THRESHOLD = 0.05
 
 if "MPLCONFIGDIR" not in os.environ:
     mpl_config_dir = Path("/tmp") / "sam2_roi_matplotlib"
@@ -144,6 +146,37 @@ def _sanitize_name(name: str, fallback: str) -> str:
     """Create a filesystem-safe ROI name."""
     cleaned = re.sub(r"[^A-Za-z0-9_.-]+", "_", name.strip()).strip("._")
     return cleaned or fallback
+
+
+def _postprocess_roi_mask(mask: np.ndarray, keep_ratio: float = ROI_AREA_RATIO_THRESHOLD) -> np.ndarray:
+    """Post-process one ROI mask by keeping large connected components and filling holes.
+
+    The procedure keeps all foreground components whose area is greater than
+    ``max_area * keep_ratio`` and fills internal holes of the kept region.
+    """
+    roi = np.asarray(mask).astype(bool, copy=False)
+    if roi.size == 0:
+        return roi
+
+    labeled, num = label(roi, structure=np.ones((3, 3), dtype=np.int8))
+    if num == 0:
+        return roi.copy()
+
+    areas = np.bincount(labeled.ravel())
+    if areas.size <= 1:
+        return roi.copy()
+
+    max_area = float(areas[1:].max())
+    if max_area <= 0:
+        return roi.copy()
+
+    keep_mask = areas[1:] > (max_area * keep_ratio)
+    keep_labels = np.flatnonzero(keep_mask) + 1
+    if keep_labels.size == 0:
+        return np.zeros_like(roi, dtype=bool)
+
+    kept = np.isin(labeled, keep_labels)
+    return np.asarray(binary_fill_holes(kept), dtype=bool)
 
 
 def _relative_path(path: Path, base_dir: Path) -> str:
@@ -792,14 +825,17 @@ class SAM2ROIAnnotationGUI:
                     multimask_output=multimask_output,
                 )
             best_idx = int(np.argmax(scores))
-            current["mask"] = np.asarray(masks[best_idx]) > 0
+            raw_mask = np.asarray(masks[best_idx]) > 0
+            current["mask"] = _postprocess_roi_mask(raw_mask)
             current["score"] = float(scores[best_idx])
             pixels = int(current["mask"].sum())
-            self.message = f"Predicted ROI mask with {pixels} pixels."
+            self.message = f"Predicted post-processed ROI mask with {pixels} pixels."
         except Exception as exc:
             current["mask"] = None
             current["score"] = None
             self.message = f"Prediction failed: {exc}"
+        self._refresh()
+        self.fig.canvas.flush_events()
 
     def _region_color(self, region_idx: int) -> tuple[np.ndarray, float]:
         """Return the display color and alpha for a region."""
