@@ -13,9 +13,11 @@ import numpy as np
 from annotation_gui import AnnotationSession, load_image_view
 from annotation_gui.base import (
     EmbeddedViewSetupController,
+    add_styled_button,
     clear_widget_axes,
     create_image_figure,
     set_image_artist,
+    set_text_box_alignment,
 )
 from annotation_gui.io import build_annotation_payload, write_annotation_json
 from interactive_snapping_2d.annotate_line_aid import LineAidAnnotationGUI
@@ -291,18 +293,21 @@ class IntegratedAnnotationGUI:
         rect: tuple[float, float, float, float],
         callback: Any | None,
         enabled: bool = True,
+        selected: bool = False,
+        primary: bool = False,
+        align: str = "center",
     ) -> Any:
-        from matplotlib.widgets import Button
-
-        ax_button = self.fig.add_axes(rect)
-        color = "#f7f7f7" if enabled else "#eeeeee"
-        button = Button(ax_button, label, color=color, hovercolor="#e6eef8")
-        if enabled and callback is not None:
-            button.on_clicked(callback)
-        else:
-            button.set_active(False)
-        self.widgets.append(button)
-        return button
+        return add_styled_button(
+            self.fig,
+            self.widgets,
+            label,
+            rect,
+            callback,
+            enabled=enabled,
+            selected=selected,
+            primary=primary,
+            align=align,
+        )
 
     def _add_text_box(
         self,
@@ -314,7 +319,8 @@ class IntegratedAnnotationGUI:
         from matplotlib.widgets import TextBox
 
         ax_box = self.fig.add_axes(rect)
-        text_box = TextBox(ax_box, label, initial=initial)
+        text_box = TextBox(ax_box, label, initial=initial, textalignment="left")
+        set_text_box_alignment(text_box, "left")
         text_box.on_submit(callback)
         self.widgets.append(text_box)
         return text_box
@@ -414,7 +420,12 @@ class IntegratedAnnotationGUI:
         y = 0.665
         for entry in page_entries:
             label = f"[DIR] {entry.name}" if entry.is_dir() else entry.name
-            self._add_button(label[:34], (0.04, y, 0.30, 0.035), lambda _event, path=entry: self._select_file_entry(path))
+            self._add_button(
+                label[:34],
+                (0.04, y, 0.30, 0.035),
+                lambda _event, path=entry: self._select_file_entry(path),
+                align="left",
+            )
             y -= 0.045
 
         total_pages = max(1, (len(self._input_entries) + FILE_ROWS_PER_PAGE - 1) // FILE_ROWS_PER_PAGE)
@@ -424,7 +435,13 @@ class IntegratedAnnotationGUI:
 
         selected = self.selected_image_path if self.selected_image_path else None
         self._add_summary_line(0.22, "Selected image", selected, max_chars=44)
-        self._add_button("Continue", (0.20, 0.07, 0.14, SIDEBAR_BUTTON_H), self._button_image_done, enabled=self.selected_image_path is not None)
+        self._add_button(
+            "Continue",
+            (0.20, 0.07, 0.14, SIDEBAR_BUTTON_H),
+            self._button_image_done,
+            enabled=self.selected_image_path is not None,
+            primary=True,
+        )
         self._render_selected_image_preview()
         self._finish_render()
 
@@ -496,7 +513,7 @@ class IntegratedAnnotationGUI:
             (0.04, 0.07, 0.12, SIDEBAR_BUTTON_H),
             lambda _event: self._show_image_step() if self.state == STATE_SELECT_OUTPUT else None,
         )
-        self._add_button("Continue", (0.20, 0.07, 0.14, SIDEBAR_BUTTON_H), self._button_output_done)
+        self._add_button("Continue", (0.20, 0.07, 0.14, SIDEBAR_BUTTON_H), self._button_output_done, primary=True)
         self._finish_render()
 
     def _button_output_done(self, _event: object) -> None:
@@ -535,10 +552,15 @@ class IntegratedAnnotationGUI:
         for option in SAM2_MODEL_OPTIONS:
             available = is_model_available(option)
             selected = option.key == self.selected_model_key
-            prefix = "[x]" if selected else "[ ]"
             suffix = "" if available else " (missing checkpoint)"
-            label = f"{prefix} {option.label}{suffix}"
-            self._add_button(label, (0.04, y, 0.30, 0.04), lambda _event, key=option.key: self._select_model(key), enabled=available)
+            label = f"{option.label}{suffix}"
+            self._add_button(
+                label,
+                (0.04, y, 0.30, 0.04),
+                lambda _event, key=option.key: self._select_model(key),
+                enabled=available,
+                selected=selected,
+            )
             self._add_text(SIDEBAR_X, y - 0.020, option.description, fontsize=8.1, color="#555555", ha="left", va="center")
             y -= 0.105
         self._add_button(
@@ -546,7 +568,7 @@ class IntegratedAnnotationGUI:
             (0.04, 0.07, 0.12, SIDEBAR_BUTTON_H),
             lambda _event: self._show_output_step() if self.state == STATE_SELECT_MODEL else None,
         )
-        self._add_button("Start", (0.20, 0.07, 0.14, SIDEBAR_BUTTON_H), self._button_model_done)
+        self._add_button("Start", (0.20, 0.07, 0.14, SIDEBAR_BUTTON_H), self._button_model_done, primary=True)
         self._finish_render()
 
     def _button_model_done(self, _event: object) -> None:
@@ -604,6 +626,7 @@ class IntegratedAnnotationGUI:
             on_done=self._on_setup_done,
             fov_deg=fov_deg,
             fallback_fov_deg=FALLBACK_FOV_DEG,
+            control_layout="sidebar",
         )
         self._connect_setup_events()
         self.setup_controller.start()
@@ -663,6 +686,7 @@ class IntegratedAnnotationGUI:
             widgets=self.widgets,
             on_complete=self._on_roi_done,
             save_close_label="Done ROI",
+            control_layout="sidebar",
         )
 
     def _on_roi_done(self, roi_gui: SAM2ROIAnnotationGUI) -> None:
@@ -700,6 +724,7 @@ class IntegratedAnnotationGUI:
             on_complete=self._on_line_done,
             save_close_label="Save Final",
             allow_empty_annotations=True,
+            control_layout="sidebar",
         )
 
     def _on_line_done(self, line_gui: LineAidAnnotationGUI) -> None:
@@ -756,7 +781,7 @@ class IntegratedAnnotationGUI:
         self._add_summary_line(0.43, "Summary", summary_path, max_chars=46)
         self._add_text(SIDEBAR_X, 0.33, f"Lines: {len(self.lines)}", fontsize=9, color="#333333", ha="left")
         self._add_text(SIDEBAR_X, 0.30, f"Regions: {len(self.regions)}", fontsize=9, color="#333333", ha="left")
-        self._add_button("Close", (0.20, 0.07, 0.14, SIDEBAR_BUTTON_H), self._button_close)
+        self._add_button("Close", (0.20, 0.07, 0.14, SIDEBAR_BUTTON_H), self._button_close, primary=True)
         self.fig.canvas.draw_idle()
 
     def _button_close(self, _event: object) -> None:

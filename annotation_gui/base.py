@@ -31,6 +31,14 @@ BUTTON_HEIGHT = 0.05
 BUTTON_GAP = 0.018
 TEXT_BOX_Y = 0.075
 TEXT_BOX_HEIGHT = 0.045
+BUTTON_COLOR = "#f7f7f7"
+BUTTON_HOVER_COLOR = "#e6eef8"
+BUTTON_SELECTED_COLOR = "#dbeafe"
+BUTTON_SELECTED_HOVER_COLOR = "#c7ddff"
+BUTTON_PRIMARY_COLOR = "#e8f0ff"
+BUTTON_DISABLED_COLOR = "#eeeeee"
+BUTTON_DISABLED_TEXT_COLOR = "#999999"
+BUTTON_TEXT_COLOR = "#222222"
 
 
 def set_image_artist(image_artist: Any, ax: Any, image: np.ndarray) -> None:
@@ -74,6 +82,80 @@ def clear_widget_axes(widgets: list[Any]) -> None:
     widgets.clear()
 
 
+def _button_colors(selected: bool = False, primary: bool = False, enabled: bool = True) -> tuple[str, str]:
+    """Return Matplotlib button colors for a shared visual state."""
+    if not enabled:
+        return BUTTON_DISABLED_COLOR, BUTTON_DISABLED_COLOR
+    if selected:
+        return BUTTON_SELECTED_COLOR, BUTTON_SELECTED_HOVER_COLOR
+    if primary:
+        return BUTTON_PRIMARY_COLOR, BUTTON_SELECTED_HOVER_COLOR
+    return BUTTON_COLOR, BUTTON_HOVER_COLOR
+
+
+def set_button_style(
+    button: Any,
+    selected: bool = False,
+    primary: bool = False,
+    enabled: bool = True,
+    align: str | None = None,
+) -> None:
+    """Apply the shared visual state to an existing Matplotlib button."""
+    color, hovercolor = _button_colors(selected=selected, primary=primary, enabled=enabled)
+    button.color = color
+    button.hovercolor = hovercolor
+    button.ax.set_facecolor(color)
+    button.label.set_color(BUTTON_TEXT_COLOR if enabled else BUTTON_DISABLED_TEXT_COLOR)
+    text_align = align or getattr(button, "_annotation_gui_align", "center")
+    button._annotation_gui_align = text_align
+    if text_align == "left":
+        button.label.set_ha("left")
+        button.label.set_position((0.04, 0.5))
+    else:
+        button.label.set_ha("center")
+        button.label.set_position((0.5, 0.5))
+
+
+def add_styled_button(
+    fig: Any,
+    widgets: list[Any],
+    label: str,
+    rect: tuple[float, float, float, float],
+    callback: Any | None,
+    enabled: bool = True,
+    selected: bool = False,
+    primary: bool = False,
+    align: str = "center",
+) -> Any:
+    """Add one shared-style Matplotlib button."""
+    from matplotlib.widgets import Button
+
+    color, hovercolor = _button_colors(selected=selected, primary=primary, enabled=enabled)
+    ax_button = fig.add_axes(rect)
+    button = Button(ax_button, label, color=color, hovercolor=hovercolor)
+    if enabled and callback is not None:
+        button.on_clicked(callback)
+    else:
+        button.set_active(False)
+    set_button_style(button, selected=selected, primary=primary, enabled=enabled, align=align)
+    widgets.append(button)
+    return button
+
+
+def set_text_box_alignment(text_box: Any, align: str = "left") -> None:
+    """Apply horizontal alignment to the editable text in a Matplotlib TextBox."""
+    text_disp = getattr(text_box, "text_disp", None)
+    if text_disp is None:
+        return
+    text_disp.set_ha(align)
+    if align == "left":
+        text_disp.set_position((0.03, 0.5))
+    elif align == "right":
+        text_disp.set_position((0.97, 0.5))
+    else:
+        text_disp.set_position((0.5, 0.5))
+
+
 def add_button_row(
     fig: Any,
     widgets: list[Any],
@@ -84,18 +166,13 @@ def add_button_row(
     x0: float | None = None,
 ) -> list[Any]:
     """Add a centered row of buttons and return the created widgets."""
-    from matplotlib.widgets import Button
-
     if not buttons:
         return []
     total_width = sum(width for _label, width, _callback in buttons) + gap * (len(buttons) - 1)
     x0 = (1.0 - total_width) * 0.5 if x0 is None else float(x0)
     created: list[Any] = []
     for label, width, callback in buttons:
-        ax_button = fig.add_axes([x0, y0, width, height])
-        button = Button(ax_button, label, color="#f7f7f7", hovercolor="#e6eef8")
-        button.on_clicked(callback)
-        widgets.append(button)
+        button = add_styled_button(fig, widgets, label, (x0, y0, width, height), callback)
         created.append(button)
         x0 += width + gap
     return created
@@ -117,7 +194,8 @@ def add_text_box(
 
     x0 = (1.0 - width) * 0.5 if x0 is None else float(x0)
     ax_box = fig.add_axes([x0, y0, width, height])
-    text_box = TextBox(ax_box, label, initial=initial)
+    text_box = TextBox(ax_box, label, initial=initial, textalignment="left")
+    set_text_box_alignment(text_box, "left")
     text_box.on_submit(callback)
     widgets.append(text_box)
     return text_box
@@ -155,6 +233,7 @@ class EmbeddedViewSetupController:
         on_done: Any,
         fov_deg: float | None,
         fallback_fov_deg: float = 90.0,
+        control_layout: str = "bottom",
     ) -> None:
         self.session = session
         self.output_dir = Path(output_dir).resolve()
@@ -169,6 +248,7 @@ class EmbeddedViewSetupController:
         self.clear_dynamic_artists = clear_dynamic_artists
         self.on_done = on_done
         self.fov_deg = fallback_fov_deg if fov_deg is None else float(fov_deg)
+        self.control_layout = control_layout
         self.default_fov_deg = float(self.fov_deg)
         self.fallback_fov_deg = float(fallback_fov_deg)
         self.fov_box: Any | None = None
@@ -208,14 +288,18 @@ class EmbeddedViewSetupController:
         self.state = STATE_CAMERA_SELECT
         self._clear_dynamic_artists()
         self.clear_controls()
-        add_button_row(
-            self.fig,
-            self.widgets,
-            [
-                ("Pinhole", 0.12, self._button_pinhole),
-                ("Panorama", 0.14, self._button_panorama),
-            ],
-        )
+        if self.control_layout == "sidebar":
+            add_styled_button(self.fig, self.widgets, "Pinhole", (0.04, 0.36, 0.14, 0.045), self._button_pinhole)
+            add_styled_button(self.fig, self.widgets, "Panorama", (0.20, 0.36, 0.14, 0.045), self._button_panorama)
+        else:
+            add_button_row(
+                self.fig,
+                self.widgets,
+                [
+                    ("Pinhole", 0.12, self._button_pinhole),
+                    ("Panorama", 0.14, self._button_panorama),
+                ],
+            )
         set_image_artist(self.image_artist, self.ax, self.session.source_view.preview)
         self.status.set_text("View setup | Choose camera mode.")
         self.help_text.set_text("Preview only; all saved coordinates use original image space.")
@@ -233,11 +317,21 @@ class EmbeddedViewSetupController:
             "FOV",
             f"{self.fov_deg:.2f}",
             self._on_fov_submit,
-            width=0.18,
-            y0=0.075,
-            x0=0.38,
+            width=0.30 if self.control_layout == "sidebar" else 0.18,
+            y0=0.36 if self.control_layout == "sidebar" else 0.075,
+            x0=0.04 if self.control_layout == "sidebar" else 0.38,
         )
-        add_button_row(self.fig, self.widgets, [("Done", 0.10, self._button_done_pinhole)], y0=0.075, x0=0.60)
+        if self.control_layout == "sidebar":
+            add_styled_button(
+                self.fig,
+                self.widgets,
+                "Done",
+                (0.20, 0.07, 0.14, 0.045),
+                self._button_done_pinhole,
+                primary=True,
+            )
+        else:
+            add_button_row(self.fig, self.widgets, [("Done", 0.10, self._button_done_pinhole)], y0=0.075, x0=0.60)
         self.status_extra = "Set pinhole horizontal FOV."
         self._refresh()
 
@@ -248,16 +342,28 @@ class EmbeddedViewSetupController:
         self.panorama_center_phi = 0.0
         self.panorama_crop_box = self._default_crop_box()
         self.clear_controls()
-        add_button_row(
-            self.fig,
-            self.widgets,
-            [
-                ("H Reset", 0.11, self._button_h_reset),
-                ("V Reset", 0.11, self._button_v_reset),
-                ("Done", 0.10, self._button_done_panorama),
-            ],
-            y0=BUTTON_ROW_Y,
-        )
+        if self.control_layout == "sidebar":
+            add_styled_button(self.fig, self.widgets, "H Reset", (0.04, 0.36, 0.14, 0.045), self._button_h_reset)
+            add_styled_button(self.fig, self.widgets, "V Reset", (0.20, 0.36, 0.14, 0.045), self._button_v_reset)
+            add_styled_button(
+                self.fig,
+                self.widgets,
+                "Done",
+                (0.20, 0.07, 0.14, 0.045),
+                self._button_done_panorama,
+                primary=True,
+            )
+        else:
+            add_button_row(
+                self.fig,
+                self.widgets,
+                [
+                    ("H Reset", 0.11, self._button_h_reset),
+                    ("V Reset", 0.11, self._button_v_reset),
+                    ("Done", 0.10, self._button_done_panorama),
+                ],
+                y0=BUTTON_ROW_Y,
+            )
         self._render_panorama_setup_image()
         self.status_extra = "Adjust panorama center and crop range."
         self._refresh()

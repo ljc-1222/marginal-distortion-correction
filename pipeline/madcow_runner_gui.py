@@ -14,7 +14,14 @@ import numpy as np
 from matplotlib.patches import Rectangle
 
 from annotation_gui import load_image_view
-from annotation_gui.base import clear_widget_axes, create_image_figure, set_image_artist
+from annotation_gui.base import (
+    add_styled_button,
+    clear_widget_axes,
+    create_image_figure,
+    set_button_style,
+    set_image_artist,
+    set_text_box_alignment,
+)
 from pipeline.annotation_launcher import repo_root
 
 
@@ -254,18 +261,21 @@ class MaDCoWRunnerGUI:
         rect: tuple[float, float, float, float],
         callback: Any | None,
         enabled: bool = True,
+        selected: bool = False,
+        primary: bool = False,
+        align: str = "center",
     ) -> Any:
-        from matplotlib.widgets import Button
-
-        ax_button = self.fig.add_axes(rect)
-        color = "#f7f7f7" if enabled else "#eeeeee"
-        button = Button(ax_button, label, color=color, hovercolor="#e6eef8")
-        if enabled and callback is not None:
-            button.on_clicked(callback)
-        else:
-            button.set_active(False)
-        self.widgets.append(button)
-        return button
+        return add_styled_button(
+            self.fig,
+            self.widgets,
+            label,
+            rect,
+            callback,
+            enabled=enabled,
+            selected=selected,
+            primary=primary,
+            align=align,
+        )
 
     def _add_text_box(
         self,
@@ -276,7 +286,8 @@ class MaDCoWRunnerGUI:
         from matplotlib.widgets import TextBox
 
         ax_box = self.fig.add_axes(rect)
-        text_box = TextBox(ax_box, "", initial=initial)
+        text_box = TextBox(ax_box, "", initial=initial, textalignment="left")
+        set_text_box_alignment(text_box, "left")
         text_box.on_submit(callback)
         self.widgets.append(text_box)
         return text_box
@@ -419,7 +430,12 @@ class MaDCoWRunnerGUI:
         y = 0.665
         for entry in page_entries:
             label = f"[DIR] {entry.name}" if entry.is_dir() else entry.name
-            self._add_button(label[:34], (0.04, y, 0.30, 0.035), lambda _event, path=entry: self._select_entry(path))
+            self._add_button(
+                label[:34],
+                (0.04, y, 0.30, 0.035),
+                lambda _event, path=entry: self._select_entry(path),
+                align="left",
+            )
             y -= 0.045
 
         total_pages = max(1, (len(self._annotation_entries) + FILE_ROWS_PER_PAGE - 1) // FILE_ROWS_PER_PAGE)
@@ -427,7 +443,13 @@ class MaDCoWRunnerGUI:
         self._add_button("Prev", (0.16, 0.265, 0.08, 0.04), self._button_prev_page, enabled=self._annotation_page > 0)
         self._add_button("Next", (0.26, 0.265, 0.08, 0.04), self._button_next_page, enabled=self._annotation_page + 1 < total_pages)
         self._add_summary_line(0.22, "Selected annotation", self.selected_annotation_path, max_chars=44)
-        self._add_button("Continue", (0.20, 0.07, 0.14, SIDEBAR_BUTTON_H), self._button_annotation_done, enabled=self.annotations_data is not None)
+        self._add_button(
+            "Continue",
+            (0.20, 0.07, 0.14, SIDEBAR_BUTTON_H),
+            self._button_annotation_done,
+            enabled=self.annotations_data is not None,
+            primary=True,
+        )
 
         if self.annotation_image_path is not None:
             self._render_image_preview(self.annotation_image_path)
@@ -526,15 +548,14 @@ class MaDCoWRunnerGUI:
             self._on_output_name_submit,
         )
         self._add_summary_line(0.390, "Corrected image", self.output_path, max_chars=46)
-        crop_label = "[x] Crop" if self.crop else "[ ] Crop"
-        self._add_button(crop_label, (0.04, 0.285, 0.14, SIDEBAR_BUTTON_H), self._button_toggle_crop)
+        self._add_button("Crop", (0.04, 0.285, 0.14, SIDEBAR_BUTTON_H), self._button_toggle_crop, selected=self.crop)
         self._add_text(SIDEBAR_X, 0.250, "Crop uses MaDCoW's existing validity-mask crop.", fontsize=8.2, color="#555555", ha="left")
         self._add_button(
             "Back",
             (0.04, 0.07, 0.12, SIDEBAR_BUTTON_H),
             lambda _event: self._show_annotation_step() if self.state == STATE_SELECT_OUTPUT else None,
         )
-        self._add_button("Start", (0.20, 0.07, 0.14, SIDEBAR_BUTTON_H), self._button_start_run)
+        self._add_button("Start", (0.20, 0.07, 0.14, SIDEBAR_BUTTON_H), self._button_start_run, primary=True)
         self._finish_render()
 
     def _button_toggle_crop(self, _event: object) -> None:
@@ -673,17 +694,18 @@ class MaDCoWRunnerGUI:
         self._add_summary_line(0.68, "Corrected image", self.output_path, max_chars=46)
         self._add_text(SIDEBAR_X, 0.56, f"Crop: {'enabled' if self.crop else 'disabled'}", fontsize=9, color="#333333", ha="left")
         self._corrected_preview_button = self._add_button(
-            "[x] Corrected",
+            "Corrected",
             (0.04, 0.45, 0.14, SIDEBAR_BUTTON_H),
             self._button_show_corrected,
+            selected=True,
         )
         self._input_preview_button = self._add_button(
-            "[ ] Input",
+            "Input",
             (0.20, 0.45, 0.14, SIDEBAR_BUTTON_H),
             self._button_show_input,
         )
         self._sync_preview_toggle_labels()
-        self._add_button("Close", (0.20, 0.07, 0.14, SIDEBAR_BUTTON_H), self._button_close)
+        self._add_button("Close", (0.20, 0.07, 0.14, SIDEBAR_BUTTON_H), self._button_close, primary=True)
         self._finish_render()
 
     def _render_complete_preview(self) -> None:
@@ -693,12 +715,10 @@ class MaDCoWRunnerGUI:
             self._render_image_preview(self.output_path, title=f"Corrected: {self._display_path(self.output_path)}")
 
     def _sync_preview_toggle_labels(self) -> None:
-        corrected_label = "[x] Corrected" if self.preview_mode == "corrected" else "[ ] Corrected"
-        input_label = "[x] Input" if self.preview_mode == "input" else "[ ] Input"
         if self._corrected_preview_button is not None:
-            self._corrected_preview_button.label.set_text(corrected_label)
+            set_button_style(self._corrected_preview_button, selected=self.preview_mode == "corrected")
         if self._input_preview_button is not None:
-            self._input_preview_button.label.set_text(input_label)
+            set_button_style(self._input_preview_button, selected=self.preview_mode == "input")
 
     def _button_show_corrected(self, _event: object) -> None:
         if self.state != STATE_COMPLETE:
@@ -726,7 +746,7 @@ class MaDCoWRunnerGUI:
         self._add_summary_line(0.76, "Annotation", self.selected_annotation_path, max_chars=46)
         self._add_summary_line(0.68, "Output", self.output_path, max_chars=46)
         self._add_text(SIDEBAR_X, 0.54, self._ellipsize(message, max_chars=70), fontsize=8.5, color="#9a3412", ha="left")
-        self._add_button("Close", (0.20, 0.07, 0.14, SIDEBAR_BUTTON_H), self._button_close)
+        self._add_button("Close", (0.20, 0.07, 0.14, SIDEBAR_BUTTON_H), self._button_close, primary=True)
         self._finish_render()
 
     def _button_close(self, _event: object) -> None:
