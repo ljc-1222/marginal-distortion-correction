@@ -251,8 +251,8 @@ mixing the derived view geometry with another image.
 ```json
 {
     "mesh": {
-        "n_lambda": 128,
-        "n_phi": 128
+        "n_lambda": 256,
+        "n_phi": 256
     },
     "loss_weights": {
         "w_l": 25,

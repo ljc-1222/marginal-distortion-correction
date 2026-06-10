@@ -112,6 +112,16 @@ input image's parent folder name, and writes the final JSON as
 `data/test1/test.png` defaults to `annotation/test1/annotation.json` unless the
 output directory is edited.
 
+Optional launcher fields can be prefilled from the command line:
+
+```bash
+python annotate.py \
+    --image data/test1/test.png \
+    --workspace annotation/test1 \
+    --output-annotation annotation/test1/annotation.json \
+    --device auto
+```
+
 Run MaDCoW correction:
 
 ```bash
@@ -132,6 +142,7 @@ The CLI path is still available:
 python run_mad.py \
     --annotations annotation/test1/annotation.json \
     --output data/test1/test_corrected_crop.png \
+    --summary outputs/test1/summary.json \
     --crop
 ```
 Or if you want the uncrop one:

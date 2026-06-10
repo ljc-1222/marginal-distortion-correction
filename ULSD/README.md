@@ -86,6 +86,10 @@ Common optional arguments:
 - `--junc-score-thresh <value>` and `--line-score-thresh <value>`: override
   ULSD proposal thresholds.
 - `--gpu <id>`: use a CUDA device when available. Use `-1` for CPU.
+- `--order <1-6>`: choose the Bezier order passed to ULSD inference.
+- `--config-path <folder>` and `--config-file <yaml>`: choose the ULSD config
+  directory and file.
+- `--num-workers <count>`: choose the DataLoader worker count.
 
 ## GUI Controls
 
