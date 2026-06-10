@@ -8,6 +8,8 @@ input image through :class:`Camera`.
 
 from __future__ import annotations
 
+import os
+
 import numpy as np
 
 from . import Array, MeshGrid
@@ -15,6 +17,7 @@ from .camera import Camera
 
 
 _EPS = 1e-12
+_FAST_RENDER_MIN_PIXELS = 250_000
 
 
 def _to_numpy(value: object) -> Array:
@@ -86,6 +89,187 @@ def _fit_projection_to_output(
 def _projection_to_pixel(p: Array, scale: float, offset: Array) -> Array:
     """Map projection-plane points to output pixel coordinates."""
     return scale * p + offset
+
+
+def _fast_render_disabled() -> bool:
+    """Return whether the optional OpenCV renderer is disabled by environment."""
+    return os.environ.get("MADCOW_EXACT_RENDER", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _triangle_area(triangle: Array) -> float:
+    """Return the signed area magnitude of a 2D triangle."""
+    edge_a = triangle[1] - triangle[0]
+    edge_b = triangle[2] - triangle[0]
+    return abs(float(edge_a[0] * edge_b[1] - edge_a[1] * edge_b[0])) * 0.5
+
+
+def _rasterize_affine_triangle(
+    cv2_module: object,
+    dst_triangle: Array,
+    src_triangle: Array,
+    map_x: Array,
+    map_y: Array,
+    filled: Array,
+    image_shape: tuple[int, int],
+) -> None:
+    """Rasterize one affine triangle into dense OpenCV remap coordinates."""
+    if _triangle_area(dst_triangle) <= _EPS:
+        return
+
+    H_out, W_out = filled.shape
+    H_img, W_img = image_shape
+    x0 = max(0, int(np.floor(dst_triangle[:, 0].min())) - 1)
+    x1 = min(W_out - 1, int(np.ceil(dst_triangle[:, 0].max())) + 1)
+    y0 = max(0, int(np.floor(dst_triangle[:, 1].min())) - 1)
+    y1 = min(H_out - 1, int(np.ceil(dst_triangle[:, 1].max())) + 1)
+    if x0 > x1 or y0 > y1:
+        return
+
+    height = y1 - y0 + 1
+    width = x1 - x0 + 1
+    local_triangle = dst_triangle - np.array([x0, y0], dtype=np.float32)
+    mask = np.zeros((height, width), dtype=np.uint8)
+    cv2_module.fillConvexPoly(mask, np.rint(local_triangle).astype(np.int32), 1)
+
+    fill_window = filled[y0 : y1 + 1, x0 : x1 + 1]
+    rel_y, rel_x = np.nonzero((mask != 0) & ~fill_window)
+    if rel_y.size == 0:
+        return
+
+    transform = cv2_module.getAffineTransform(
+        dst_triangle.astype(np.float32, copy=False),
+        src_triangle.astype(np.float32, copy=False),
+    )
+    out_x = rel_x + x0
+    out_y = rel_y + y0
+    src_x = transform[0, 0] * out_x + transform[0, 1] * out_y + transform[0, 2]
+    src_y = transform[1, 0] * out_x + transform[1, 1] * out_y + transform[1, 2]
+    valid = (
+        np.isfinite(src_x)
+        & np.isfinite(src_y)
+        & (src_x >= 0.0)
+        & (src_x <= W_img - 1.0)
+        & (src_y >= 0.0)
+        & (src_y <= H_img - 1.0)
+    )
+    if not bool(valid.any()):
+        return
+
+    out_x_valid = out_x[valid]
+    out_y_valid = out_y[valid]
+    map_x[out_y_valid, out_x_valid] = src_x[valid].astype(np.float32, copy=False)
+    map_y[out_y_valid, out_x_valid] = src_y[valid].astype(np.float32, copy=False)
+    filled[out_y_valid, out_x_valid] = True
+
+
+def _warp_image_fast(
+    image_arr: Array,
+    camera: Camera,
+    mesh: MeshGrid,
+    p_arr: Array,
+    out_size: tuple[int, int],
+    return_mask: bool,
+    valid_mesh: Array | None,
+) -> Array | tuple[Array, Array] | None:
+    """Render large uint8 RGB images through an OpenCV affine-triangle remap."""
+    if _fast_render_disabled():
+        return None
+    if valid_mesh is None or image_arr.ndim != 3 or image_arr.dtype != np.uint8:
+        return None
+    H_out, W_out = out_size
+    if H_out * W_out < _FAST_RENDER_MIN_PIXELS:
+        return None
+
+    try:
+        import cv2
+    except ImportError:
+        return None
+
+    scale, offset = _fit_projection_to_output(p_arr, out_size, valid_mesh)
+    p_pixels = _projection_to_pixel(p_arr, scale, offset).astype(np.float32, copy=False)
+    lam_grid = np.asarray(mesh.lambda_grid, dtype=np.float64)
+    phi_grid = np.asarray(mesh.phi_grid, dtype=np.float64)
+    src_x, src_y = camera.direction_to_pixel(lam_grid, phi_grid)
+    src_valid = (
+        valid_mesh
+        & camera.direction_in_fov(lam_grid, phi_grid)
+        & np.isfinite(src_x)
+        & np.isfinite(src_y)
+        & np.isfinite(p_pixels[..., 0])
+        & np.isfinite(p_pixels[..., 1])
+        & (src_x >= 0.0)
+        & (src_x <= image_arr.shape[1] - 1.0)
+        & (src_y >= 0.0)
+        & (src_y <= image_arr.shape[0] - 1.0)
+    )
+    valid_quads = (
+        src_valid[:-1, :-1]
+        & src_valid[:-1, 1:]
+        & src_valid[1:, :-1]
+        & src_valid[1:, 1:]
+    )
+    quad_indices = np.argwhere(valid_quads)
+    if quad_indices.size == 0:
+        empty = np.zeros((H_out, W_out, image_arr.shape[2]), dtype=image_arr.dtype)
+        empty_mask = np.zeros((H_out, W_out), dtype=bool)
+        return (empty, empty_mask) if return_mask else empty
+
+    map_x = np.full((H_out, W_out), -1.0, dtype=np.float32)
+    map_y = np.full((H_out, W_out), -1.0, dtype=np.float32)
+    filled = np.zeros((H_out, W_out), dtype=bool)
+    src_pixels = np.stack((src_x, src_y), axis=-1).astype(np.float32, copy=False)
+
+    for i_raw, j_raw in quad_indices:
+        i = int(i_raw)
+        j = int(j_raw)
+        dst_quad = np.array(
+            [
+                p_pixels[i, j],
+                p_pixels[i, j + 1],
+                p_pixels[i + 1, j],
+                p_pixels[i + 1, j + 1],
+            ],
+            dtype=np.float32,
+        )
+        src_quad = np.array(
+            [
+                src_pixels[i, j],
+                src_pixels[i, j + 1],
+                src_pixels[i + 1, j],
+                src_pixels[i + 1, j + 1],
+            ],
+            dtype=np.float32,
+        )
+        _rasterize_affine_triangle(
+            cv2,
+            dst_quad[[0, 1, 3]],
+            src_quad[[0, 1, 3]],
+            map_x,
+            map_y,
+            filled,
+            image_arr.shape[:2],
+        )
+        _rasterize_affine_triangle(
+            cv2,
+            dst_quad[[0, 3, 2]],
+            src_quad[[0, 3, 2]],
+            map_x,
+            map_y,
+            filled,
+            image_arr.shape[:2],
+        )
+
+    rendered = cv2.remap(
+        image_arr,
+        map_x,
+        map_y,
+        interpolation=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=0,
+    )
+    if return_mask:
+        return rendered, filled.copy()
+    return rendered
 
 
 def _pixel_to_projection(x: Array, y: Array, scale: float, offset: Array) -> Array:
@@ -299,6 +483,9 @@ def warp_image(
     p_arr = _to_numpy(p_final).astype(np.float64, copy=False)
     _validate_inputs(image_arr, mesh, p_arr, out_size)
     valid_mesh = _validate_valid_mesh_mask(valid_mesh_mask, mesh)
+    fast_rendered = _warp_image_fast(image_arr, camera, mesh, p_arr, out_size, return_mask, valid_mesh)
+    if fast_rendered is not None:
+        return fast_rendered
 
     H_out, W_out = out_size
     squeeze = image_arr.ndim == 2
