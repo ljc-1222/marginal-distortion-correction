@@ -10,3 +10,8 @@ sam2/checkpoints/*.pt
 
 # Test image and json files
 data/
+outputs/
+annotation/
+!data/test1/
+!data/test1/image.png
+
