@@ -2,7 +2,15 @@
 
 [Project overview](../README.md) · [Using the system](usage.md)
 
-The qualitative project experiments examine a classroom panorama view and a pinhole wide-angle portrait. The comparisons focus on the visual effect of user constraints: preserving selected objects while guiding scene structures through a global warp.
+The qualitative project experiments use a numbered test pattern, a classroom panorama view, and a pinhole wide-angle portrait to examine how user constraints guide local object appearance and scene structures through a global warp.
+
+## Separate constraint effects
+
+![Numbered-pattern input with a red ROI outline and vertical line, compared with unannotated, ROI-only, and line-only correction.](assets/numbered-constraints.svg)
+
+The red outline marks the right-hand green block containing the two columns of numbers 1/5/9/13 and 2/6/10/14. The red line follows the vertical divider between those columns. The original view shows the targets; the three output panels retain the experiment images without overlays.
+
+Without annotations, the output is mainly determined by the stereographic initialization and regularization. The ROI-only result changes the local projection of the selected block, while the line-only result makes the selected divider straighter. These separate variants illustrate the complementary roles of region and structural constraints.
 
 ## Global correction
 
@@ -22,9 +30,7 @@ Global shape changes alone do not explain the effect of annotation. The local co
 
 These panels are the corresponding local crops used in the project experiments. Each crop keeps its original aspect ratio; the same scene features can move or change scale between warps.
 
-![A numbered test pattern shown as the original view, an output without annotations, an ROI-only output, and a line-only output.](assets/constraint-study.jpg)
-
-The numbered pattern separates the roles of the constraints. Without annotations, the output is mainly determined by the stereographic initialization and regularization. ROI constraints guide a selected region toward a local projection, while line constraints guide structural straightness. The separate variants illustrate why the final workflow accepts both kinds of information. The local photographs above compare the combined annotation workflow with the unannotated setting.
+The local photographs compare the combined annotation workflow with the unannotated setting, complementing the separate-constraint pattern above.
 
 ## Why use interactive snapping?
 

@@ -69,4 +69,4 @@ For setup-script changes, `bash -n setup.sh` checks shell syntax and `bash setup
 
 **ULSD.** The optional line-candidate frontend uses ULSD by Hao Li et al. The upstream license is retained in [ULSD/LICENSE](../ULSD/LICENSE); its [module reference](../ULSD/README.md#paper-and-citation) links the source and publication.
 
-**Project figures.** The [asset source list](assets/SOURCES.md) identifies the inputs used for the comparison figures. The project was developed by 林進成 and 黃義凱 for Computational Photography at National Tsing Hua University.
+**Project figures.** The [asset source list](assets/SOURCES.md) identifies the inputs used for the comparison figures. The project was developed by [@ljc-1222](https://github.com/ljc-1222) and [@tuna00662244](https://github.com/tuna00662244) for Computational Photography at National Tsing Hua University.
