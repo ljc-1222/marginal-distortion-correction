@@ -2,6 +2,20 @@
 # Run with either:
 #   source ./setup.sh   # keeps .venv active in the current shell
 #   bash setup.sh       # installs and verifies, but does not activate the caller shell
+# Add --sam2-model tiny|small|base-plus|large to download only one checkpoint.
+
+setup_usage() {
+    cat <<'USAGE'
+Usage: bash setup.sh [--sam2-model MODEL]
+       source ./setup.sh [--sam2-model MODEL]
+
+Create .venv, install requirements.txt, download SAM2.1 checkpoints, and check imports.
+
+Options:
+  --sam2-model MODEL  tiny, small, base-plus, large, or all (default: all)
+  -h, --help         Show this help without installing or downloading anything.
+USAGE
+}
 
 is_sourced() {
     [ "${BASH_SOURCE[0]}" != "$0" ]
@@ -86,6 +100,37 @@ PY
 }
 
 main() {
+    local sam2_model="all"
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --sam2-model)
+                if [ "$#" -lt 2 ]; then
+                    echo "--sam2-model requires tiny, small, base-plus, large, or all." >&2
+                    return 2
+                fi
+                sam2_model="$2"
+                shift 2
+                ;;
+            -h|--help)
+                setup_usage
+                return 0
+                ;;
+            *)
+                echo "Unknown option: $1" >&2
+                setup_usage >&2
+                return 2
+                ;;
+        esac
+    done
+
+    case "$sam2_model" in
+        tiny|small|base-plus|large|all) ;;
+        *)
+            echo "Unknown SAM2 model: $sam2_model. Choose tiny, small, base-plus, large, or all." >&2
+            return 2
+            ;;
+    esac
+
     if ! command -v python3 >/dev/null 2>&1; then
         echo "python3 is required to create the virtual environment."
         return 1
@@ -101,11 +146,18 @@ main() {
     python -m pip install -r requirements.txt || return 1
 
     mkdir -p sam2/checkpoints || return 1
-    SAM2_CHECKPOINT_BASE_URL="https://dl.fbaipublicfiles.com/segment_anything_2/092824"
-    download_sam2_checkpoint "sam2.1_hiera_tiny.pt" "${SAM2_CHECKPOINT_BASE_URL}/sam2.1_hiera_tiny.pt" || return 1
-    download_sam2_checkpoint "sam2.1_hiera_small.pt" "${SAM2_CHECKPOINT_BASE_URL}/sam2.1_hiera_small.pt" || return 1
-    download_sam2_checkpoint "sam2.1_hiera_base_plus.pt" "${SAM2_CHECKPOINT_BASE_URL}/sam2.1_hiera_base_plus.pt" || return 1
-    download_sam2_checkpoint "sam2.1_hiera_large.pt" "${SAM2_CHECKPOINT_BASE_URL}/sam2.1_hiera_large.pt" || return 1
+    local checkpoint_base_url="https://dl.fbaipublicfiles.com/segment_anything_2/092824"
+    local selected_models=()
+    case "$sam2_model" in
+        all) selected_models=(tiny small base_plus large) ;;
+        base-plus) selected_models=(base_plus) ;;
+        *) selected_models=("$sam2_model") ;;
+    esac
+    local model_name
+    for model_name in "${selected_models[@]}"; do
+        download_sam2_checkpoint "sam2.1_hiera_${model_name}.pt" \
+            "${checkpoint_base_url}/sam2.1_hiera_${model_name}.pt" || return 1
+    done
 
     verify_setup || return 1
 
