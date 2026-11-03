@@ -11,13 +11,9 @@ bash setup.sh --sam2-model small
 source .venv/bin/activate
 ```
 
-The setup script creates `.venv`, installs `requirements.txt`, downloads the selected SAM2.1 checkpoint, and checks imports for the integrated workflow. `source ./setup.sh --sam2-model small` also keeps the environment active in the current shell.
+The setup script creates `.venv`, installs `requirements.txt`, downloads the selected SAM2.1 checkpoint, and checks imports. `source ./setup.sh --sam2-model small` also keeps the environment active in the current shell.
 
-Select a checkpoint with `--sam2-model tiny`, `small`, `base-plus`, or `large`. The GUI exposes whichever checkpoints are present under `sam2/checkpoints/`. Running `bash setup.sh` without options preserves the original behavior and downloads all four models; `--sam2-model all` does the same explicitly. Existing non-empty checkpoints are reused. Downloads require `curl` or `wget`.
-
-The checkpoints use the filenames `sam2.1_hiera_tiny.pt`, `sam2.1_hiera_small.pt`, `sam2.1_hiera_base_plus.pt`, and `sam2.1_hiera_large.pt`. Their model configurations are bundled in the repository.
-
-`requirements.txt` records the existing project environment, including pinned Python packages and CUDA components. The import check confirms that modules load; it does not run segmentation or image correction.
+Choose `tiny`, `small`, `base-plus`, or `large` with `--sam2-model`. Running setup without this option, or choosing `all`, downloads all four models. The setup script reuses existing non-empty checkpoint files. The GUI exposes the installed models. Downloads require `curl` or `wget`; checkpoint details are in the [ROI reference](../sam2/README.md#annotate-rois).
 
 ## Create an annotation
 
@@ -37,7 +33,7 @@ The CLI arguments prefill the integrated GUI. The workflow stays in one window, 
 
 The final annotation is written to `<workspace>/annotation.json`. A custom path can be supplied through `--output-annotation`. `--device auto` prefers CUDA for SAM2 when available; `--device cpu` explicitly selects CPU inference.
 
-### Choose the right snapping mode
+### Snapping modes
 
 **Line** mode returns an exactly straight segment in the displayed image plane. Use it when the target structure already appears straight in that view.
 

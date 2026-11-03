@@ -1,30 +1,49 @@
 # Interactive Marginal Distortion Correction
 
-An interactive system for correcting marginal distortion in wide-angle photographs and panorama views. It combines a Python implementation of **MaDCoW** with **SAM2-assisted region selection** and **stroke snapping for structural constraints**, so users can guide both object appearance and scene geometry.
+A Python implementation of [MaDCoW (CVPR 2025)](https://openaccess.thecvf.com/content/CVPR2025/html/Zhang_MaDCoW_Marginal_Distortion_Correction_for_Wide-Angle_Photography_with_Arbitrary_Objects_CVPR_2025_paper.html) with interactive annotation tools for wide-angle photographs and panorama views. SAM2-assisted ROI masks and snapped structural annotations let users guide object appearance and scene geometry through a GUI workflow.
 
-[Quick start](#quick-start) · [Results and analysis](docs/results.md) · [Annotation guide](docs/usage.md)
+[Examples](#correction-examples) · [Quick start](#quick-start) · [Results and analysis](docs/results.md) · [Annotation guide](docs/usage.md)
 
-![Three rows of input-output pairs: original view and unannotated correction; line-marked input and line-only correction; ROI-marked input and ROI-only correction.](docs/assets/numbered-constraints.svg)
+## Project contributions
 
-*Top: original view and correction without annotations. Middle: line-marked input and line-only result. Bottom: ROI-marked input and ROI-only result.*
+- **MaDCoW implementation.** Local ROI projection fitting, angular-mesh initialization, global warp optimization, rendering, and optional validity-mask cropping.
+- **Assisted annotation tools.** SAM2 point/box prompts with mask cleanup, plus stroke snapping for real-world straight structures that may appear straight or curved in the input image.
+- **GUI workflow.** Camera/view setup, ROI and line annotation, correction progress, and output preview are available through GUIs. The annotation stages share one coordinate system.
 
-## What the project implements
+## Correction examples
 
-- **A complete correction pipeline.** Fit local projections for selected regions, initialize an angular mesh, optimize a global warp, and render the corrected image with optional validity-mask cropping.
-- **Assisted constraint creation.** Use point or box prompts to generate ROI masks with SAM2, then draw rough strokes that snap to nearby image structures. Mask cleanup removes small components and fills holes before export.
-- **An integrated GUI workflow.** Camera/view setup, ROI and line annotation, correction progress, and output preview are available through GUIs, with one shared coordinate system for the annotations.
+The numbered pattern illustrates the separate effects of structural and region constraints.
 
-The correction formulation follows [MaDCoW, CVPR 2025](https://openaccess.thecvf.com/content/CVPR2025/html/Zhang_MaDCoW_Marginal_Distortion_Correction_for_Wide-Angle_Photography_with_Arbitrary_Objects_CVPR_2025_paper.html). This project implements the correction workflow and builds the annotation tools around it.
+### Without annotations
 
-## How the constraints affect the result
+<p>
+  <a href="docs/assets/numbered-input.svg"><img src="docs/assets/numbered-input.svg" width="49%" alt="Unannotated original numbered-pattern input" /></a>
+  <a href="docs/assets/numbered-unconstrained.svg"><img src="docs/assets/numbered-unconstrained.svg" width="49%" alt="Numbered-pattern correction without annotations" /></a>
+</p>
 
-ROI masks identify objects whose local appearance should be preserved. Structural annotations identify real-world straight features, including features that appear curved in the input image. MaDCoW combines these targets with conformality and smoothness terms to determine the final warp.
+The unconstrained output follows the stereographic initialization and regularization, leaving the right-hand divider curved.
 
-The numbered example presents each treatment as its own input-output pair. The middle row shows how a line constraint straightens the selected vertical divider; the bottom row shows how an ROI constraint guides the local projection of the right-hand green block. The [results and analysis](docs/results.md) also include panorama and portrait examples, local comparisons, and observed failure cases.
+### Line constraint
+
+<p>
+  <a href="docs/assets/numbered-line-input.svg"><img src="docs/assets/numbered-line-input.svg" width="49%" alt="Original input with only the selected vertical divider marked in red" /></a>
+  <a href="docs/assets/numbered-line-result.svg"><img src="docs/assets/numbered-line-result.svg" width="49%" alt="Correction with only the line constraint" /></a>
+</p>
+
+The selected vertical divider becomes straighter under the line constraint.
+
+### ROI constraint
+
+<p>
+  <a href="docs/assets/numbered-roi-input.svg"><img src="docs/assets/numbered-roi-input.svg" width="49%" alt="Original input with only the right-hand green ROI outlined in red" /></a>
+  <a href="docs/assets/numbered-roi-result.svg"><img src="docs/assets/numbered-roi-result.svg" width="49%" alt="Correction with only the ROI constraint" /></a>
+</p>
+
+The selected green block receives a local projection target, changing its shape within the global warp. [Results and analysis](docs/results.md) cover the photographic examples, annotation tradeoffs, and failure cases.
 
 ## Quick start
 
-Use a Bash shell and a Python environment compatible with the [recorded dependencies](requirements.txt). The Matplotlib interfaces require a desktop display. See the [installation notes](docs/usage.md#installation) for the environment and checkpoint details.
+Use a Bash shell and an interactive desktop display for the Matplotlib GUIs. See the [installation notes](docs/usage.md#installation) for environment requirements.
 
 ```bash
 git clone https://github.com/ljc-1222/marginal-distortion-correction.git
@@ -33,25 +52,19 @@ bash setup.sh --sam2-model small
 source .venv/bin/activate
 ```
 
-Start the integrated annotator with the bundled image:
+Open the integrated annotator with the bundled image:
 
 ```bash
 python annotate.py --image data/test1/image.png --workspace annotation/test1
 ```
 
-Choose the installed **Small** model, confirm the camera/view setup, create ROI masks, and accept snapped structural annotations. Saving writes `annotation/test1/annotation.json` together with the required masks and any derived panorama view.
-
-Run correction with the saved annotation:
+Choose **Small**, confirm the camera/view setup, create the ROI and line annotations, and save. Then open the correction runner:
 
 ```bash
-python run_mad.py \
-    --annotations annotation/test1/annotation.json \
-    --output outputs/test1/image_corrected.png \
-    --summary outputs/test1/summary.json \
-    --crop
+python run_mad.py
 ```
 
-Omit `--crop` to retain the full rendered output. Run `python annotate.py` or `python run_mad.py` without arguments to use their file-selection GUIs. The [annotation guide](docs/usage.md) explains view selection, ROI prompts, snapping modes, and output files.
+Select `annotation/test1/annotation.json`, choose the output and crop settings, and run correction. The [annotation guide](docs/usage.md) includes controls, output files, and CLI commands.
 
 ## Documentation
 
@@ -66,4 +79,4 @@ Omit `--crop` to retain the full rendered output. Run `python annotate.py` or `p
 
 Computational Photography final project by [@ljc-1222](https://github.com/ljc-1222) and [@tuna00662244](https://github.com/tuna00662244), National Tsing Hua University.
 
-The system builds on [MaDCoW](https://openaccess.thecvf.com/content/CVPR2025/html/Zhang_MaDCoW_Marginal_Distortion_Correction_for_Wide-Angle_Photography_with_Arbitrary_Objects_CVPR_2025_paper.html) by Zhang et al. and [SAM 2](https://github.com/facebookresearch/sam2) by Ravi et al. [ULSD](ULSD/README.md) is retained as an explored automatic line-candidate frontend. See the [source acknowledgments](docs/development.md#sources-and-licenses) for upstream code and licenses.
+The annotation tools use [SAM 2](https://github.com/facebookresearch/sam2). [ULSD](ULSD/README.md) is retained as an explored automatic line-candidate frontend. See the [source acknowledgments](docs/development.md#sources-and-licenses) for the underlying research, code, and licenses.

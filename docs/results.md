@@ -4,21 +4,17 @@
 
 The qualitative project experiments use a numbered test pattern, a classroom panorama view, and a pinhole wide-angle portrait to examine how user constraints guide local object appearance and scene structures through a global warp.
 
-## Separate constraint effects
+## Constraint comparison
 
-![Three independent input-output pairs for correction without annotations, with a line constraint, and with an ROI constraint, ordered from top to bottom.](assets/numbered-constraints.svg)
+The [numbered-pattern examples](../README.md#correction-examples) compare three independent settings on the same input: no annotations, one line constraint, and one ROI constraint. The line follows the divider between the two right-hand green columns; the ROI covers the green block containing 1/5/9/13 and 2/6/10/14.
 
-Each row pairs its own input on the left with the corresponding correction on the right. The top row uses the original view without annotations. In the middle row, only the vertical divider between the right-hand green columns is marked with a red line. In the bottom row, only the green block containing the columns 1/5/9/13 and 2/6/10/14 is outlined as an ROI. The output panels retain the experiment images without overlays.
-
-Without annotations, the output is mainly determined by the stereographic initialization and regularization. The line-only result makes the selected divider straighter, while the ROI-only result changes the local projection of the selected block. These independent variants illustrate the complementary roles of structural and region constraints.
+Without annotations, the warp mainly follows the stereographic initialization and regularization. A line constraint adds a straightness target for the sampled feature. An ROI constraint instead fits a local projection and guides the global warp toward it. The line-only and ROI-only outputs show the different roles of these two forms of user input.
 
 ## Global correction
 
 ![Original and corrected panorama-view and pinhole examples.](assets/correction-examples.jpg)
 
 In the classroom example, correction redistributes the wide field of view across the output. In the portrait example, the local face projection changes together with the surrounding ceiling, desks, and floor. The black areas in the corrected panels are outside the rendered valid image region; the examples retain these borders to show the full output extent.
-
-Global shape changes alone do not explain the effect of annotation. The local comparisons below show where the user constraints influence the result.
 
 ## ROI and structural constraints
 
@@ -28,21 +24,13 @@ Global shape changes alone do not explain the effect of annotation. The local co
 
 **Face appearance.** The ROI constraint guides the face toward its fitted local projection. This changes the shape around the forehead, cheek, and nose while the rest of the image adapts through the global warp. The selected region and its surrounding background remain coupled, which also explains the boundary artifacts discussed below.
 
-These panels are the corresponding local crops used in the project experiments. Each crop keeps its original aspect ratio; the same scene features can move or change scale between warps.
-
-The local photographs compare the combined annotation workflow with the unannotated setting, complementing the separate-constraint pattern above.
-
-## Why use interactive snapping?
+## Line annotation design
 
 The project also explored ULSD as an automatic line-candidate frontend. In the tested building image, the detections include fragmented structures, responses on secondary edges, and uneven coverage of useful geometric constraints. Changing detection thresholds did not remove the need to select which structures should guide MaDCoW.
 
 ![The ULSD building input and its detected line candidates.](assets/ulsd-candidates.jpg)
 
-[ULSD](https://www.sciencedirect.com/science/article/pii/S0924271621001623) represents distorted line segments with Bézier curves and supports pinhole, fisheye, and spherical imagery. For this project, interactive snapping gives users direct control over which of these structures become correction constraints.
-
-The integrated workflow lets the user choose a meaningful structure and refines the stroke using local edge, orientation, color, continuity, and distance evidence. The user reviews that result before export. `Line` and `Curve` modes describe the input image trace; both can represent a real-world straight feature. Algorithm details are in the [snapping reference](../interactive_snapping_2d/README.md).
-
-The [ULSD frontend](../ULSD/README.md) remains available as a separate experimental path, including automatic detection and manual review of line candidates.
+[ULSD](https://www.sciencedirect.com/science/article/pii/S0924271621001623) supports distorted line segments through a Bézier representation. The integrated workflow uses interactive snapping to focus annotation on structures selected by the user: local edge, orientation, color, continuity, and distance evidence refine each rough stroke before review and export. `Line` and `Curve` modes describe the input image trace; both can represent a real-world straight feature. See the [snapping reference](../interactive_snapping_2d/README.md) for details and the [ULSD frontend](../ULSD/README.md) for the separate automatic-detection path.
 
 ## Observed limitations
 
@@ -52,7 +40,7 @@ The [ULSD frontend](../ULSD/README.md) remains available as a separate experimen
 
 **Excessive panorama extent.** Very wide selected views can produce heavily stretched or collapsed output meshes. The example illustrates a practical limit of the current workflow. Restricting view extent or checking mesh validity before rendering could make this failure easier to handle.
 
-**Phone ultra-wide example.** In a tested 0.6× phone image with an effective FOV of about 114°, linear-projection initialization produced a more satisfactory result than stereographic initialization. The project report attributes this behavior to the smaller FOV; this remains an explanation for that case rather than a universal FOV threshold. The phone image was excluded from the final successful-example comparisons.
+**Phone ultra-wide example.** In a tested 0.6× phone image with an effective FOV of about 114°, linear-projection initialization produced a more satisfactory result than stereographic initialization. This case illustrates the influence of initialization on the correction result.
 
 ## Figure sources
 
