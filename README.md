@@ -4,9 +4,9 @@ An interactive system for correcting marginal distortion in wide-angle photograp
 
 [Quick start](#quick-start) · [Results and analysis](docs/results.md) · [Annotation guide](docs/usage.md)
 
-![Numbered-pattern comparison showing the selected right-hand ROI and vertical line in red, followed by unannotated, ROI-only, and line-only outputs.](docs/assets/numbered-constraints.svg)
+![Three rows of input-output pairs: original view and unannotated correction; line-marked input and line-only correction; ROI-marked input and ROI-only correction.](docs/assets/numbered-constraints.svg)
 
-*The red outline identifies the right-hand green ROI; the red line marks the selected vertical divider. The outputs compare correction without annotations, with the ROI constraint, and with the line constraint.*
+*Top: original view and correction without annotations. Middle: line-marked input and line-only result. Bottom: ROI-marked input and ROI-only result.*
 
 ## What the project implements
 
@@ -20,7 +20,7 @@ The correction formulation follows [MaDCoW, CVPR 2025](https://openaccess.thecvf
 
 ROI masks identify objects whose local appearance should be preserved. Structural annotations identify real-world straight features, including features that appear curved in the input image. MaDCoW combines these targets with conformality and smoothness terms to determine the final warp.
 
-The numbered example separates these effects: ROI-only correction guides the local projection of the right-hand green block, while line-only correction straightens the selected vertical divider. The [results and analysis](docs/results.md) also include panorama and portrait examples, local comparisons, and observed failure cases.
+The numbered example presents each treatment as its own input-output pair. The middle row shows how a line constraint straightens the selected vertical divider; the bottom row shows how an ROI constraint guides the local projection of the right-hand green block. The [results and analysis](docs/results.md) also include panorama and portrait examples, local comparisons, and observed failure cases.
 
 ## Quick start
 

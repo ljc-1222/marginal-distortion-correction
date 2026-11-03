@@ -6,11 +6,11 @@ The qualitative project experiments use a numbered test pattern, a classroom pan
 
 ## Separate constraint effects
 
-![Numbered-pattern input with a red ROI outline and vertical line, compared with unannotated, ROI-only, and line-only correction.](assets/numbered-constraints.svg)
+![Three independent input-output pairs for correction without annotations, with a line constraint, and with an ROI constraint, ordered from top to bottom.](assets/numbered-constraints.svg)
 
-The red outline marks the right-hand green block containing the two columns of numbers 1/5/9/13 and 2/6/10/14. The red line follows the vertical divider between those columns. The original view shows the targets; the three output panels retain the experiment images without overlays.
+Each row pairs its own input on the left with the corresponding correction on the right. The top row uses the original view without annotations. In the middle row, only the vertical divider between the right-hand green columns is marked with a red line. In the bottom row, only the green block containing the columns 1/5/9/13 and 2/6/10/14 is outlined as an ROI. The output panels retain the experiment images without overlays.
 
-Without annotations, the output is mainly determined by the stereographic initialization and regularization. The ROI-only result changes the local projection of the selected block, while the line-only result makes the selected divider straighter. These separate variants illustrate the complementary roles of region and structural constraints.
+Without annotations, the output is mainly determined by the stereographic initialization and regularization. The line-only result makes the selected divider straighter, while the ROI-only result changes the local projection of the selected block. These independent variants illustrate the complementary roles of structural and region constraints.
 
 ## Global correction
 
